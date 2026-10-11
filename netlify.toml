@@ -1,0 +1,20 @@
+[build]
+  publish = "public"
+  functions = "netlify/functions"
+  command = "echo 'No build step'"
+
+[functions]
+  node_bundler = "esbuild"
+  included_files = ["lib/**"]
+
+# The share sheet posts to /share-target; the service worker normally catches it.
+# If it doesn't (first launch), send the person to the app instead of a 404.
+[[redirects]]
+  from = "/share-target"
+  to = "/?shared=1"
+  status = 303
+
+[[headers]]
+  for = "/sw.js"
+  [headers.values]
+    Cache-Control = "no-cache"

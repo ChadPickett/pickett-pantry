@@ -1,0 +1,13 @@
+{
+  "name": "pickett-pantry",
+  "private": true,
+  "type": "module",
+  "description": "Family recipe box: share a link from your phone and it looks up the recipe.",
+  "dependencies": {
+    "@anthropic-ai/sdk": "0.127.0",
+    "@netlify/blobs": "11.1.0"
+  },
+  "devDependencies": {
+    "@netlify/functions": "6.0.0"
+  }
+}
