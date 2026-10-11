@@ -1,37 +1,117 @@
 import type { Config, Context } from "@netlify/functions";
 import { getStore } from "@netlify/blobs";
 import Anthropic from "@anthropic-ai/sdk";
-import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { createRemoteJWKSet, jwtVerify } from "jose";
+import { randomBytes } from "node:crypto";
 import {
   findJsonLdRecipe, mapJsonLd, htmlToText, platformOf, getMeta, captionFromOg,
-  youtubeDescription, firstUrl, parseJsonReply, cleanText,
+  youtubeDescription, firstUrl, parseJsonReply,
 } from "../../lib/extract.mjs";
+import { FIREBASE_PROJECT_ID } from "../../lib/firebase-config.mjs";
 
 const MODEL = "claude-haiku-5-5";
 const COLLECTIONS = ["recipes", "cookbooks", "plan", "groceries", "settings"];
 const ID_RE = /^[A-Za-z0-9_\-.~:@+]{1,80}$/;
+const AI_MONTHLY_LIMIT = Number(process.env.AI_MONTHLY_LIMIT || 40);
 const BROWSER_UA = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Mobile Safari/537.36";
 const PREVIEW_UA = "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)";
 
-const data = () => getStore({ name: "pantry", consistency: "strong" });
+const store = () => getStore({ name: "pantry", consistency: "strong" });
 const photos = () => getStore({ name: "photos", consistency: "strong" });
+const newId = () => Date.now().toString(36) + randomBytes(8).toString("hex");
 
 const json = (body: unknown, status = 200) =>
   new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", "cache-control": "no-store" } });
-const fail = (message: string, status = 400) => json({ error: message }, status);
+const fail = (message: string, status = 400, extra: Record<string, unknown> = {}) => json({ error: message, ...extra }, status);
 
-/* ---------------- passcode ---------------- */
-type Auth = { salt: string; hash: string };
-const hashPass = (salt: string, pass: string) => createHash("sha256").update(salt + ":" + pass).digest("hex");
-const tokenFor = (a: Auth) => createHmac("sha256", a.hash).update("pickett-pantry-session-v1").digest("hex");
-async function getAuth(): Promise<Auth | null> { return (await data().get("meta/auth", { type: "json" })) as Auth | null; }
-function same(a: string, b: string) { const x = Buffer.from(a), y = Buffer.from(b); return x.length === y.length && timingSafeEqual(x, y); }
-async function authed(req: Request) {
-  const a = await getAuth(); if (!a) return false;
-  const t = req.headers.get("x-pp-token") || "";
-  return !!t && same(t, tokenFor(a));
+/* ---------------- accounts (Firebase sign-in) ---------------- */
+const JWKS = createRemoteJWKSet(new URL("https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com"));
+type Who = { uid: string; email: string; name: string };
+async function whoIs(req: Request): Promise<Who | null> {
+  const h = req.headers.get("authorization") || "";
+  const token = h.startsWith("Bearer ") ? h.slice(7) : "";
+  if (!token) return null;
+  try {
+    const { payload } = await jwtVerify(token, JWKS, { issuer: `https://securetoken.google.com/${FIREBASE_PROJECT_ID}`, audience: FIREBASE_PROJECT_ID });
+    if (!payload.sub) return null;
+    const email = String((payload as any).email || "");
+    return { uid: String(payload.sub), email, name: String((payload as any).name || email.split("@")[0] || "Cook") };
+  } catch { return null; }
 }
-async function bump() { await data().set("meta/rev", Date.now().toString(36) + randomBytes(3).toString("hex")); }
+
+type UserRec = { kitchenId: string; name: string; email: string; createdAt: number };
+type Kitchen = { name: string; ownerUid: string; members: string[]; inviteCode: string; createdAt: number };
+
+async function getJSON<T>(key: string): Promise<T | null> { return (await store().get(key, { type: "json" })) as T | null; }
+async function putJSON(key: string, v: unknown) { await store().setJSON(key, v); }
+
+async function newKitchen(who: Who): Promise<string> {
+  const kid = newId();
+  const inviteCode = randomBytes(6).toString("hex");
+  await putJSON(`kitchens/${kid}`, { name: (who.name.split(" ")[0] || "My") + "’s Kitchen", ownerUid: who.uid, members: [who.uid], inviteCode, createdAt: Date.now() } satisfies Kitchen);
+  await putJSON(`invites/${inviteCode}`, { kitchenId: kid });
+  return kid;
+}
+
+/** Look up (or create on first sign-in) the person's record and kitchen. */
+async function account(who: Who) {
+  let user = await getJSON<UserRec>(`users/${who.uid}`);
+  let kitchen = user ? await getJSON<Kitchen>(`kitchens/${user.kitchenId}`) : null;
+  if (!user || !kitchen || !kitchen.members.includes(who.uid)) {
+    const kitchenId = await newKitchen(who);
+    user = { kitchenId, name: who.name, email: who.email, createdAt: user?.createdAt || Date.now() };
+    await putJSON(`users/${who.uid}`, user);
+    kitchen = (await getJSON<Kitchen>(`kitchens/${kitchenId}`))!;
+    if (!(await store().get("meta/admin"))) await store().set("meta/admin", who.uid); // first person ever is the site owner
+  } else if (user.name !== who.name || user.email !== who.email) {
+    const oldDefault = (user.name.split(" ")[0] || "My") + "’s Kitchen";
+    if (kitchen.ownerUid === who.uid && kitchen.name === oldDefault) {
+      kitchen = { ...kitchen, name: (who.name.split(" ")[0] || "My") + "’s Kitchen" };
+      await putJSON(`kitchens/${user.kitchenId}`, kitchen);
+    }
+    user = { ...user, name: who.name, email: who.email };
+    await putJSON(`users/${who.uid}`, user);
+  }
+  return { user, kitchen, kid: user.kitchenId };
+}
+
+async function isUnlimited(k: Kitchen) {
+  const admin = await store().get("meta/admin");
+  return !!admin && k.members.includes(String(admin));
+}
+const monthKey = () => new Date().toISOString().slice(0, 7);
+async function usage(kid: string, k: Kitchen) {
+  const u = (await getJSON<{ count: number }>(`k/${kid}/usage/${monthKey()}`)) || { count: 0 };
+  const unlimited = await isUnlimited(k);
+  return { used: u.count, limit: unlimited ? null : AI_MONTHLY_LIMIT };
+}
+async function spendAi(kid: string, k: Kitchen) {
+  const u = await usage(kid, k);
+  if (u.limit != null && u.used >= u.limit) return false;
+  await putJSON(`k/${kid}/usage/${monthKey()}`, { count: u.used + 1 });
+  return true;
+}
+const LIMIT_MSG = "Your kitchen has used all of this month’s Claude imports. Recipe website links still work, and the count resets on the 1st.";
+
+async function bump(kid: string) { await store().set(`k/${kid}/rev`, Date.now().toString(36) + randomBytes(3).toString("hex")); }
+
+async function readKitchenData(kid: string) {
+  const s = store();
+  const out: Record<string, any> = { rev: (await s.get(`k/${kid}/rev`)) || "0" };
+  await Promise.all(COLLECTIONS.map(async (col) => {
+    const prefix = `k/${kid}/${col}/`;
+    const { blobs } = await s.list({ prefix });
+    const docs = await Promise.all(blobs.map(async (b) => { const d = await s.get(b.key, { type: "json" }); return d ? { ...(d as any), id: b.key.slice(prefix.length) } : null; }));
+    out[col] = docs.filter(Boolean);
+  }));
+  out.settings = (out.settings as any[]).find((d) => d.id === "main") || {};
+  return out;
+}
+
+async function memberList(k: Kitchen) {
+  const people = await Promise.all(k.members.map(async (uid) => { const u = await getJSON<UserRec>(`users/${uid}`); return { uid, name: u?.name || "Cook", email: u?.email || "", owner: uid === k.ownerUid }; }));
+  return people;
+}
 
 /* ---------------- Claude ---------------- */
 let client: Anthropic | null = null;
@@ -94,7 +174,7 @@ async function savePhotoFromUrl(imageUrl: string): Promise<string | null> {
     if (!r.ok || !/^image\/(jpeg|png|webp|gif|avif)/.test(type)) return null;
     const buf = await r.arrayBuffer();
     if (buf.byteLength < 2000 || buf.byteLength > 6_000_000) return null;
-    const id = Date.now().toString(36) + randomBytes(8).toString("hex");
+    const id = newId();
     await photos().set(id, buf, { metadata: { type } });
     return id;
   } catch { return null; }
@@ -125,7 +205,6 @@ async function lookUp(url: string): Promise<Found> {
     if (caption.length < 40 && title.length > caption.length) caption = captionFromOg(title);
     return { caption, imageUrl: getMeta(g.text, "og:image"), finalUrl: g.url, platform };
   }
-  // websites and Pinterest
   const g = await grab(url);
   const node = findJsonLdRecipe(g.text);
   if (node) {
@@ -139,7 +218,7 @@ async function lookUp(url: string): Promise<Found> {
   return { caption: htmlToText(g.text), imageUrl: getMeta(g.text, "og:image"), finalUrl: g.url, platform };
 }
 
-async function importRecipe(body: any) {
+async function importRecipe(body: any, spend: () => Promise<boolean>) {
   const shared = String(body.text || "");
   const url = String(body.url || "").trim() || firstUrl(shared);
   const extra = shared.replace(url, "").trim();
@@ -148,6 +227,7 @@ async function importRecipe(body: any) {
   if (images.length) {
     const parsed = images.map((d: string) => { const m = String(d).match(/^data:(image\/(?:jpeg|png|webp|gif));base64,(.+)$/); return m ? { media_type: m[1], data: m[2] } : null; }).filter(Boolean);
     if (!parsed.length) return { error: "Those images couldn’t be read. Try JPG or PNG." };
+    if (!(await spend())) return { error: LIMIT_MSG, limit: true };
     const r = await structure(extra, url, parsed as any);
     return r ? { recipe: r, method: "photo" } : { error: "Claude couldn’t find a recipe in those images." };
   }
@@ -165,6 +245,7 @@ async function importRecipe(body: any) {
     if (text.replace(/\s/g, "").length < 40) {
       return { error: found.platform === "web" ? "That page didn’t include a readable recipe. Paste the recipe text instead." : "That post’s caption couldn’t be read (the account may be private, or the recipe is only in the video). Take a screenshot of the recipe and share that instead.", url: found.finalUrl };
     }
+    if (!(await spend())) return { error: LIMIT_MSG, limit: true, url: found.finalUrl };
     const r = await structure(text, found.finalUrl || url);
     if (!r) return { error: found.platform === "web" ? "Claude couldn’t find a recipe on that page." : "That post doesn’t have the recipe written in its caption. If it’s only in the video, take a screenshot of the recipe and share that instead.", url: found.finalUrl };
     if (!r.notes && found.author) r.notes = "Recipe by " + found.author;
@@ -172,6 +253,7 @@ async function importRecipe(body: any) {
     return { recipe: { ...r, imageId }, method: "caption" };
   }
   if (extra.length >= 20) {
+    if (!(await spend())) return { error: LIMIT_MSG, limit: true };
     const r = await structure(extra, "");
     return r ? { recipe: r, method: "text" } : { error: "Claude couldn’t find a recipe in that text." };
   }
@@ -185,70 +267,101 @@ export default async (req: Request, _ctx: Context) => {
   const method = req.method;
 
   try {
-    // public photo serving (ids are long random strings)
+    /* public routes */
     if (path[0] === "photo" && path[1] && method === "GET") {
       if (!ID_RE.test(path[1])) return fail("bad id", 404);
       const r = await photos().getWithMetadata(path[1], { type: "arrayBuffer" });
       if (!r) return new Response("not found", { status: 404 });
       return new Response(r.data as ArrayBuffer, { headers: { "content-type": String((r.metadata as any)?.type || "image/jpeg"), "cache-control": "public, max-age=31536000, immutable" } });
     }
-
-    if (path[0] === "status" && method === "GET") {
-      return json({ setup: !(await getAuth()), ai: !!process.env.ANTHROPIC_API_KEY });
+    if (path[0] === "status" && method === "GET") return json({ ai: !!process.env.ANTHROPIC_API_KEY, configured: !FIREBASE_PROJECT_ID.startsWith("REPLACE") });
+    if (path[0] === "share" && path[1] && method === "GET") {
+      if (!ID_RE.test(path[1])) return fail("That link isn’t valid.", 404);
+      const s = await getJSON<any>(`shares/${path[1]}`);
+      return s ? json(s) : fail("That recipe link has expired or was removed.", 404);
     }
 
-    if (path[0] === "login" && method === "POST") {
-      const { passcode } = await req.json().catch(() => ({}));
-      const pass = String(passcode || "");
-      let a = await getAuth();
-      if (!a) {
-        if (pass.length < 4) return fail("Pick a passcode with at least 4 characters.");
-        const salt = randomBytes(16).toString("hex");
-        a = { salt, hash: hashPass(salt, pass) };
-        await data().setJSON("meta/auth", a);
-        return json({ token: tokenFor(a), created: true });
+    /* everything else needs a signed-in person */
+    const who = await whoIs(req);
+    if (!who) return fail("Please sign in again.", 401);
+    const { user, kitchen, kid } = await account(who);
+
+    if (path[0] === "me" && method === "GET") {
+      return json({
+        user: { uid: who.uid, name: user.name, email: user.email },
+        kitchen: { id: kid, name: kitchen.name, owner: kitchen.ownerUid === who.uid, inviteCode: kitchen.inviteCode, members: await memberList(kitchen) },
+        usage: await usage(kid, kitchen),
+      });
+    }
+
+    if (path[0] === "kitchen") {
+      const body = method === "POST" ? await req.json().catch(() => ({})) : {};
+      if (path[1] === "rename" && method === "POST") {
+        const name = String(body.name || "").trim().slice(0, 60); if (!name) return fail("Type a name.");
+        await putJSON(`kitchens/${kid}`, { ...kitchen, name }); return json({ ok: true });
       }
-      if (!same(hashPass(a.salt, pass), a.hash)) { await new Promise((r) => setTimeout(r, 800)); return fail("That passcode isn’t right.", 401); }
-      return json({ token: tokenFor(a) });
+      if (path[1] === "invite" && method === "POST") {
+        await store().delete(`invites/${kitchen.inviteCode}`);
+        const inviteCode = randomBytes(6).toString("hex");
+        await putJSON(`kitchens/${kid}`, { ...kitchen, inviteCode }); await putJSON(`invites/${inviteCode}`, { kitchenId: kid });
+        return json({ inviteCode });
+      }
+      if (path[1] === "invite" && path[2] && method === "GET") {
+        const inv = await getJSON<{ kitchenId: string }>(`invites/${path[2]}`);
+        const k = inv && (await getJSON<Kitchen>(`kitchens/${inv.kitchenId}`));
+        if (!inv || !k || k.inviteCode !== path[2]) return fail("That invite link is no longer valid. Ask for a new one.", 404);
+        const owner = await getJSON<UserRec>(`users/${k.ownerUid}`);
+        return json({ kitchenName: k.name, ownerName: owner?.name || "", already: inv.kitchenId === kid });
+      }
+      if (path[1] === "join" && method === "POST") {
+        const code = String(body.code || "");
+        const inv = /^[a-f0-9]{12}$/.test(code) ? await getJSON<{ kitchenId: string }>(`invites/${code}`) : null;
+        const target = inv && (await getJSON<Kitchen>(`kitchens/${inv.kitchenId}`));
+        if (!inv || !target || target.inviteCode !== code) return fail("That invite link is no longer valid. Ask for a new one.", 404);
+        if (inv.kitchenId === kid) return json({ ok: true });
+        // bring your recipes and cookbooks along if you were cooking alone
+        if (kitchen.members.length === 1 && body.bringRecipes !== false) {
+          const s = store();
+          for (const col of ["recipes", "cookbooks"]) {
+            const { blobs } = await s.list({ prefix: `k/${kid}/${col}/` });
+            for (const b of blobs) { const d = await s.get(b.key, { type: "json" }); if (d) await s.setJSON(`k/${inv.kitchenId}/${col}/${b.key.split("/").pop()}`, d); }
+          }
+        }
+        await leaveKitchen(who.uid, kid, kitchen);
+        await putJSON(`kitchens/${inv.kitchenId}`, { ...target, members: Array.from(new Set([...target.members, who.uid])) });
+        await putJSON(`users/${who.uid}`, { ...user, kitchenId: inv.kitchenId });
+        await bump(inv.kitchenId);
+        return json({ ok: true });
+      }
+      if (path[1] === "leave" && method === "POST") {
+        if (kitchen.members.length === 1) return fail("You’re the only one in this kitchen.");
+        await leaveKitchen(who.uid, kid, kitchen);
+        const fresh = await newKitchen(who);
+        await putJSON(`users/${who.uid}`, { ...user, kitchenId: fresh });
+        return json({ ok: true });
+      }
+      if (path[1] === "remove" && method === "POST") {
+        if (kitchen.ownerUid !== who.uid) return fail("Only the kitchen’s owner can remove people.", 403);
+        const uid = String(body.uid || ""); if (!kitchen.members.includes(uid) || uid === who.uid) return fail("That person isn’t in your kitchen.");
+        await putJSON(`kitchens/${kid}`, { ...kitchen, members: kitchen.members.filter((m) => m !== uid) });
+        return json({ ok: true }); // their next visit gives them a fresh kitchen
+      }
     }
 
-    if (!(await authed(req))) return fail("Please sign in again.", 401);
-
-    if (path[0] === "passcode" && method === "POST") {
-      const { passcode } = await req.json().catch(() => ({}));
-      const pass = String(passcode || ""); if (pass.length < 4) return fail("Pick a passcode with at least 4 characters.");
-      const salt = randomBytes(16).toString("hex"); const a = { salt, hash: hashPass(salt, pass) };
-      await data().setJSON("meta/auth", a);
-      return json({ token: tokenFor(a) });
-    }
-
-    if (path[0] === "rev" && method === "GET") {
-      return json({ rev: (await data().get("meta/rev")) || "0" });
-    }
-
-    if (path[0] === "data" && method === "GET") {
-      const store = data();
-      const out: Record<string, any> = { rev: (await store.get("meta/rev")) || "0" };
-      await Promise.all(COLLECTIONS.map(async (col) => {
-        const { blobs } = await store.list({ prefix: col + "/" });
-        const docs = await Promise.all(blobs.map(async (b) => { const d = await store.get(b.key, { type: "json" }); return d ? { ...(d as any), id: b.key.slice(col.length + 1) } : null; }));
-        out[col] = docs.filter(Boolean);
-      }));
-      out.settings = (out.settings as any[]).find((d) => d.id === "main") || {};
-      return json(out);
-    }
+    if (path[0] === "rev" && method === "GET") return json({ rev: (await store().get(`k/${kid}/rev`)) || "0" });
+    if (path[0] === "data" && method === "GET") return json(await readKitchenData(kid));
 
     if (path[0] === "doc" && COLLECTIONS.includes(path[1]) && path[2] && ID_RE.test(path[2])) {
-      const key = path[1] + "/" + path[2];
+      const key = `k/${kid}/${path[1]}/${path[2]}`;
       if (method === "PUT") {
         const body = await req.json();
         if (!body || typeof body !== "object" || Array.isArray(body)) return fail("Expected an object.");
-        const s = JSON.stringify(body); if (s.length > 300_000) return fail("That item is too large.");
+        if (JSON.stringify(body).length > 300_000) return fail("That item is too large.");
         delete (body as any).id;
-        await data().setJSON(key, body); await bump();
+        await store().setJSON(key, body); await bump(kid);
         return json({ ok: true });
       }
-      if (method === "DELETE") { await data().delete(key); await bump(); return json({ ok: true }); }
+      if (method === "DELETE") { await store().delete(key); await bump(kid); return json({ ok: true }); }
     }
 
     if (path[0] === "photo" && method === "POST") {
@@ -256,14 +369,28 @@ export default async (req: Request, _ctx: Context) => {
       if (!/^image\/(jpeg|png|webp|gif)$/.test(type)) return fail("Use a JPG, PNG or WebP image.");
       const buf = await req.arrayBuffer();
       if (buf.byteLength > 5_000_000) return fail("That photo is too large.");
-      const id = Date.now().toString(36) + randomBytes(8).toString("hex");
+      const id = newId();
       await photos().set(id, buf, { metadata: { type } });
+      return json({ id });
+    }
+
+    if (path[0] === "share" && method === "POST") {
+      const body = await req.json().catch(() => ({}));
+      const r = body.recipe;
+      if (!r || typeof r !== "object" || !r.title) return fail("Nothing to share.");
+      const keep = ["title", "description", "servings", "prepMin", "cookMin", "cuisine", "tags", "ingredients", "steps", "notes", "sourceUrl", "imageId"];
+      const recipe: Record<string, unknown> = {}; for (const k of keep) if (r[k] != null) recipe[k] = r[k];
+      if (JSON.stringify(recipe).length > 200_000) return fail("That recipe is too large to share.");
+      const id = randomBytes(9).toString("base64url");
+      await putJSON(`shares/${id}`, { recipe, from: user.name, createdAt: Date.now() });
       return json({ id });
     }
 
     if (path[0] === "import" && method === "POST") {
       const body = await req.json().catch(() => ({}));
-      return json(await importRecipe(body));
+      const res: any = await importRecipe(body, () => spendAi(kid, kitchen));
+      res.usage = await usage(kid, kitchen);
+      return json(res);
     }
 
     if (path[0] === "ai" && method === "POST") {
@@ -274,6 +401,7 @@ export default async (req: Request, _ctx: Context) => {
       for (let i = messages.length - 1; i > 0; i--) if (messages[i].role === messages[i - 1].role) { messages[i - 1] = { role: messages[i].role, content: messages[i - 1].content + "\n\n" + messages[i].content }; messages.splice(i, 1); }
       if (messages[0].role !== "user") messages.shift();
       if (JSON.stringify(messages).length > 120_000) return fail("That’s too much text.");
+      if (!(await spendAi(kid, kitchen))) return fail(LIMIT_MSG, 429, { limit: true });
       const text = await ask(messages, Math.min(Number(body.maxTokens) || 1500, 3000), typeof body.system === "string" ? body.system.slice(0, 20000) : undefined);
       if (body.json) { const j = parseJsonReply(text); if (j == null) return fail("Claude’s answer didn’t come back in a usable form. Try again.", 502); return json({ data: j }); }
       return json({ text });
@@ -286,5 +414,11 @@ export default async (req: Request, _ctx: Context) => {
     return fail("Something went wrong on the server. Try again.", 500);
   }
 };
+
+async function leaveKitchen(uid: string, kid: string, k: Kitchen) {
+  const members = k.members.filter((m) => m !== uid);
+  if (!members.length) return; // an empty kitchen just sits unused
+  await putJSON(`kitchens/${kid}`, { ...k, members, ownerUid: k.ownerUid === uid ? members[0] : k.ownerUid });
+}
 
 export const config: Config = { path: "/api/*" };

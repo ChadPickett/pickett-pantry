@@ -6,6 +6,7 @@
 <meta name="theme-color" content="#2b56b0">
 <meta name="description" content="Pickett family recipe box, meal planner and grocery list.">
 <link rel="manifest" href="/manifest.webmanifest">
+<script src="/firebase-config.js"></script>
 <link rel="icon" href="/icon-192.png">
 <link rel="apple-touch-icon" href="/icon-192.png">
 <title>Pickett Pantry</title>
@@ -433,9 +434,8 @@ function itemKey(item){
 function cleanName(item){ return String(item || '').replace(/\(.*?\)/g, '').replace(STRIP_WORDS, '').replace(/\s+/g, ' ').replace(/^[\s,]+|[\s,]+$/g, '').trim() || item; }
 
 /* ---------------- state ---------------- */
-const TOKEN_INIT = (() => { try { return JSON.parse(localStorage.getItem('pp_token') || '""'); } catch (e) { return ''; } })();
 const S = {
-  ready: false, noDb: false, canWrite: true, auth: TOKEN_INIT ? 'ok' : 'checking', offline: false, rev: null, aiOn: true, setup: false,
+  ready: false, noDb: false, canWrite: true, auth: 'checking', offline: false, rev: null, aiOn: true, me: null, loginMode: 'signin',
   recipes: [], cookbooks: [], plan: [], groceries: [], settings: {},
   loaded: { recipes: false, cookbooks: false, plan: false, groceries: false },
   tab: lsGet('tab', 'recipes'),
@@ -445,10 +445,19 @@ const S = {
   chats: {},
 };
 let DB = null, USER = null, SAMPLE = null, ASSETS = null, IMG_OK = true;
-let TOKEN = lsGet('token', '');
+let FB = null;
+const FB_VER = '12.19.0';
+async function loadFirebase(){
+  if (FB) return FB;
+  const app = await import('https://www.gstatic.com/firebasejs/' + FB_VER + '/firebase-app.js');
+  const mod = await import('https://www.gstatic.com/firebasejs/' + FB_VER + '/firebase-auth.js');
+  const auth = mod.getAuth(app.initializeApp(window.FIREBASE_CONFIG));
+  FB = { auth, mod }; return FB;
+}
+async function authToken(){ try { return FB && FB.auth.currentUser ? await FB.auth.currentUser.getIdToken() : ''; } catch (e) { return ''; } }
 async function api(path, opts){
   opts = opts || {};
-  const headers = Object.assign({}, opts.headers || {}); if (TOKEN) headers['x-pp-token'] = TOKEN;
+  const headers = Object.assign({}, opts.headers || {}); const tk = opts.noAuth ? '' : await authToken(); if (tk) headers.authorization = 'Bearer ' + tk;
   let body = opts.body;
   if (body != null && !(body instanceof Blob) && typeof body !== 'string') { body = JSON.stringify(body); headers['content-type'] = 'application/json'; }
   let r;
@@ -460,11 +469,12 @@ async function api(path, opts){
   }
   if (S.offline) { S.offline = false; render(); }
   let j = null; try { j = await r.json(); } catch (e) {}
-  if (r.status === 401 && path !== 'login') { TOKEN = ''; lsSet('token', ''); S.auth = 'login'; S.ov = []; render(); throw { code: 'auth', message: 'Please sign in again.' }; }
-  if (!r.ok) throw { code: r.status === 503 ? 'ai_off' : 'server', message: (j && j.error) || 'Something went wrong. Try again.' };
+  if (r.status === 401) { S.auth = 'login'; S.ov = []; render(); throw { code: 'auth', message: 'Please sign in again.' }; }
+  if (j && j.usage && S.me) S.me.usage = j.usage;
+  if (!r.ok) throw { code: r.status === 503 ? 'ai_off' : r.status === 429 ? 'limit' : 'server', message: (j && j.error) || 'Something went wrong. Try again.' };
   return j || {};
 }
-function saveCache(){ lsSet('cache', { recipes: S.recipes, cookbooks: S.cookbooks, plan: S.plan, groceries: S.groceries, settings: S.settings }); }
+function saveCache(){ lsSet('cache', { uid: S.me && S.me.user && S.me.user.uid, recipes: S.recipes, cookbooks: S.cookbooks, plan: S.plan, groceries: S.groceries, settings: S.settings }); }
 function localSet(col, id, doc){
   if (col === 'settings') { S.settings = doc ? Object.assign({}, doc) : {}; saveCache(); return; }
   const arr = S[col]; const i = arr.findIndex(x => x.id === id);
@@ -553,13 +563,22 @@ function render(opts){
 }
 function vLogin(){
   if (S.auth === 'checking') return '<div class="login"><span class="spin"></span></div>';
-  const setup = S.setup;
-  return '<div class="login"><form class="login-card" data-form="login"><div class="card-art">' + indexCard({ title: 'Pickett Pantry' }) + '</div><h1>Pickett Pantry</h1>' +
-    '<p class="muted" style="margin:0">' + (setup ? 'Pick a household passcode. You and Hannah will both use it to sign in.' : 'Enter your household passcode.') + '</p>' +
-    '<label class="sr" for="pass">Passcode</label><input id="pass" class="inp" type="password" autocomplete="current-password" placeholder="Passcode" value="' + esc(dv('pass')) + '">' +
-    (setup ? '<label class="sr" for="pass2">Type it again</label><input id="pass2" class="inp" type="password" autocomplete="new-password" placeholder="Type it again" value="' + esc(dv('pass2')) + '">' : '') +
-    (S.loginErr ? '<div class="banner warn" style="text-align:left"><div>' + esc(S.loginErr) + '</div></div>' : '') +
-    '<button class="btn primary" data-act="login"' + (S.loginBusy ? ' disabled' : '') + '>' + (S.loginBusy ? '<span class="spin"></span>' : '') + (setup ? 'Create passcode' : 'Sign in') + '</button></form></div>';
+  if (S.auth === 'unconfigured') return '<div class="login"><div class="login-card"><h1>Pickett Pantry</h1><p class="muted">Sign-in isn’t set up yet. Finish the Firebase setup steps, then reload.</p></div></div>';
+  const m = S.loginMode;
+  let h = '<div class="login"><form class="login-card" data-form="login" novalidate><div class="card-art">' + indexCard({ title: 'Pickett Pantry' }) + '</div><h1>Pickett Pantry</h1>';
+  if (S.pendingNote) h += '<div class="banner"><div>' + esc(S.pendingNote) + '</div></div>';
+  if (m !== 'reset') {
+    h += '<button type="button" class="btn" data-act="googleIn" style="min-height:50px"' + (S.loginBusy ? ' disabled' : '') + '><svg viewBox="0 0 24 24" aria-hidden="true" style="width:20px;height:20px"><path d="M21.6 12.2c0-.7-.1-1.4-.2-2H12v3.8h5.4a4.6 4.6 0 0 1-2 3v2.5h3.2c1.9-1.7 3-4.3 3-7.3z" fill="#4285F4" stroke="none"/><path d="M12 22c2.7 0 5-.9 6.6-2.4l-3.2-2.5c-.9.6-2 1-3.4 1-2.6 0-4.8-1.8-5.6-4.1H3.1v2.6A10 10 0 0 0 12 22z" fill="#34A853" stroke="none"/><path d="M6.4 14c-.2-.6-.3-1.3-.3-2s.1-1.4.3-2V7.4H3.1a10 10 0 0 0 0 9.2z" fill="#FBBC05" stroke="none"/><path d="M12 5.9c1.5 0 2.8.5 3.8 1.5l2.8-2.8A10 10 0 0 0 3.1 7.4L6.4 10c.8-2.4 3-4.1 5.6-4.1z" fill="#EA4335" stroke="none"/></svg>Continue with Google</button>';
+    h += '<div class="row" style="justify-content:center;flex-wrap:nowrap" aria-hidden="true"><span style="flex:1;height:1px;background:var(--line)"></span><span class="small muted">or use email</span><span style="flex:1;height:1px;background:var(--line)"></span></div>';
+  }
+  if (m === 'signup') h += '<label class="sr" for="lg-name">Your name</label><input id="lg-name" class="inp" autocomplete="name" placeholder="Your name" value="' + esc(dv('lg-name')) + '">';
+  h += '<label class="sr" for="lg-email">Email</label><input id="lg-email" class="inp" type="email" inputmode="email" autocomplete="email" placeholder="Email" value="' + esc(dv('lg-email')) + '">';
+  if (m !== 'reset') h += '<label class="sr" for="lg-pass">Password</label><input id="lg-pass" class="inp" type="password" autocomplete="' + (m === 'signup' ? 'new-password' : 'current-password') + '" placeholder="' + (m === 'signup' ? 'Password (6+ characters)' : 'Password') + '" value="' + esc(dv('lg-pass')) + '">';
+  if (S.loginErr) h += '<div class="banner warn" style="text-align:left"><div>' + esc(S.loginErr) + '</div></div>';
+  if (S.loginMsg) h += '<div class="banner" style="text-align:left"><div>' + esc(S.loginMsg) + '</div></div>';
+  h += '<button class="btn primary" data-act="emailIn" style="min-height:50px"' + (S.loginBusy ? ' disabled' : '') + '>' + (S.loginBusy ? '<span class="spin"></span>' : '') + (m === 'signup' ? 'Create account' : m === 'reset' ? 'Send reset email' : 'Sign in') + '</button>';
+  h += '<div class="row" style="justify-content:center">' + (m === 'signin' ? '<button type="button" class="btn ghost small" data-act="loginMode" data-v="signup">Create an account</button><button type="button" class="btn ghost small" data-act="loginMode" data-v="reset">Forgot password?</button>' : '<button type="button" class="btn ghost small" data-act="loginMode" data-v="signin">I already have an account</button>') + '</div>';
+  return h + '</form></div>';
 }
 function view(){
   if (S.auth !== 'ok') return vLogin();
@@ -694,13 +713,22 @@ function vMore(){
   h += '<div class="li"><div class="grow"><b>Show measurements</b><div class="small muted">Default for every recipe</div></div><div class="seg">' + [['original','Original'],['imperial','US'],['metric','Metric']].map(o => '<button data-act="setUnits" data-v="' + o[0] + '" class="' + (S.ui.units === o[0] ? 'on' : '') + '">' + o[1] + '</button>').join('') + '</div></div>';
   h += '<button class="li" data-act="backup"><span style="color:var(--accent)">' + I.copy + '</span><div class="grow"><b>Copy a backup</b><div class="small muted">Copies every recipe as text you can paste into a file</div></div></button>';
   h += '</div></div>';
+  const me = S.me;
+  if (me) {
+    const k = me.kitchen, u = me.usage || {};
+    h += '<div class="sec"><div class="sec-h"><h2>' + esc(k.name) + '</h2>' + (k.owner ? '<button class="btn small" data-act="kRename">' + I.edit + 'Rename</button>' : '') + '</div>';
+    h += '<p class="muted small" style="margin:0 0 10px">Everyone in this kitchen shares the same recipes, meal plan and grocery list.</p><div class="list">';
+    h += k.members.map(p => '<div class="li"><div class="grow"><b>' + esc(p.name) + (p.uid === me.user.uid ? ' (you)' : '') + '</b><div class="small muted">' + esc(p.email) + (p.owner ? ' · Owner' : '') + '</div></div>' + (k.owner && p.uid !== me.user.uid ? '<button class="btn small ghost danger" data-act="kRemove" data-id="' + esc(p.uid) + '">Remove</button>' : '') + '</div>').join('');
+    h += '<button class="li" data-act="kInvite"><span style="color:var(--accent)">' + I.plus + '</span><div class="grow"><b>Invite someone to this kitchen</b><div class="small muted">For people you share groceries with. Others can make their own account.</div></div></button>';
+    if (k.members.length > 1) h += '<button class="li" data-act="kLeave"><span style="color:var(--rule-red)">' + I.back + '</span><div class="grow"><b>Leave this kitchen</b></div></button>';
+    h += '</div>';
+    h += '<p class="small muted" style="margin:10px 0 0">Claude imports this month: <b>' + (u.used || 0) + '</b>' + (u.limit == null ? ' (no limit)' : ' of ' + u.limit) + '. Recipe website links don’t count.</p></div>';
+  }
   h += '<div class="sec"><h2 style="font-size:1.35rem;margin-bottom:10px">This phone</h2><div class="list">';
   if (installEvt) h += '<button class="li" data-act="install"><span style="color:var(--accent)">' + I.plus + '</span><div class="grow"><b>Install the app</b><div class="small muted">Adds it to your home screen and Share menu</div></div></button>';
   else h += '<div class="li"><span style="color:var(--accent)">' + I.check + '</span><div class="grow"><b>Share menu</b><div class="small muted">' + (window.matchMedia && matchMedia('(display-mode: standalone)').matches ? 'Installed. Pick Pickett Pantry from any app’s Share menu.' : 'In Chrome, tap ⋮ then “Add to Home screen” or “Install app” to get it in your Share menu.') + '</div></div></div>';
-  h += '<button class="li" data-act="changePass"><span style="color:var(--accent)">' + I.edit + '</span><div class="grow"><b>Change household passcode</b></div></button>';
-  h += '<button class="li" data-act="signOut"><span style="color:var(--accent)">' + I.back + '</span><div class="grow"><b>Sign out on this phone</b></div></button>';
+  h += '<button class="li" data-act="signOut"><span style="color:var(--accent)">' + I.back + '</span><div class="grow"><b>Sign out</b>' + (me ? '<div class="small muted">' + esc(me.user.email) + '</div>' : '') + '</div></button>';
   h += '</div></div>';
-  h += '<div class="sec"><h2 style="font-size:1.35rem;margin-bottom:10px">Sharing with Hannah</h2><p class="muted" style="margin:0">Send her the web address and the household passcode. You both see the same recipes, meal plan and grocery list.</p></div>';
   return h;
 }
 
@@ -726,7 +754,15 @@ function vOverlay(o){
     case 'rMenu': return vRMenu(o);
     case 'aiPlan': return vAiPlan(o);
     case 'nutri': return '';
-    case 'newPass': return sheet('<h2>Change passcode</h2><div class="field"><label for="np1">New passcode</label><input id="np1" class="inp" type="password" autocomplete="new-password" value="' + esc(dv('np1')) + '"></div><div class="field"><label for="np2">Type it again</label><input id="np2" class="inp" type="password" autocomplete="new-password" value="' + esc(dv('np2')) + '"></div><div class="row" style="justify-content:flex-end"><button class="btn ghost" data-act="close">Cancel</button><button class="btn primary" data-act="savePass">Change</button></div>', 'Change passcode');
+    case 'kName': return sheet('<h2>Rename kitchen</h2><div class="field"><label for="kn">Name</label><input id="kn" class="inp" value="' + esc(dv('kn')) + '" data-enter="kRenameSave"></div><div class="row" style="justify-content:flex-end"><button class="btn ghost" data-act="close">Cancel</button><button class="btn primary" data-act="kRenameSave">Save</button></div>', 'Rename kitchen');
+    case 'join': return sheet('<h2>Join ' + esc(o.kitchenName) + '?</h2><p class="muted" style="margin:0">You’ll share recipes, the meal plan and the grocery list with ' + esc(o.ownerName || 'them') + '.' + (S.me && S.me.kitchen.members.length === 1 && S.recipes.length ? ' Your ' + S.recipes.length + ' recipe' + (S.recipes.length === 1 ? '' : 's') + ' come with you.' : '') + '</p><div class="row" style="justify-content:flex-end"><button class="btn ghost" data-act="close">Not now</button><button class="btn primary" data-act="kJoin"' + (o.busy ? ' disabled' : '') + '>' + (o.busy ? '<span class="spin"></span>' : '') + 'Join kitchen</button></div>', 'Join kitchen');
+    case 'sharedRecipe': {
+      const r = o.recipe || {};
+      return '<div class="ov"><div class="ov-in">' + bar('Recipe from ' + (o.from || 'a friend')) + thumb(r, 'hero') + '<h1 class="rtitle">' + esc(r.title) + '</h1>' + (r.description ? '<p>' + esc(r.description) + '</p>' : '') +
+        '<button class="btn primary cookbtn" data-act="saveShared"' + (o.busy ? ' disabled' : '') + '>' + (o.busy ? '<span class="spin"></span>' : I.plus) + 'Save to my recipes</button>' +
+        '<section class="sec"><div class="sec-h"><h2>Ingredients</h2></div><ul class="ings">' + (r.ingredients || []).map(l => { const d = ingDisplay(l, 1, 'original'); return !d ? '' : d.heading ? '<li class="h">' + esc(d.heading) + '</li>' : '<li><span>' + (d.q ? '<b>' + esc(d.q) + '</b> ' : '') + esc(d.rest) + '</span></li>'; }).join('') + '</ul></section>' +
+        '<section class="sec"><div class="sec-h"><h2>Instructions</h2></div><ol class="steps">' + (r.steps || []).map(s => /:$/.test(s) && s.length < 60 ? '<li class="h">' + esc(s.replace(/:$/, '')) + '</li>' : '<li><span>' + esc(s) + '</span></li>').join('') + '</ol></section></div></div>';
+    }
   }
   return '';
 }
@@ -782,7 +818,7 @@ function vRecipe(o){
   return h;
 }
 function vRMenu(o){
-  return sheet('<h2>Recipe options</h2><div class="list"><button class="li" data-act="copyRecipe" data-id="' + esc(o.id) + '">' + I.copy + '<span class="grow">Copy recipe as text</span></button><button class="li" data-act="dupRecipe" data-id="' + esc(o.id) + '">' + I.book + '<span class="grow">Duplicate</span></button><button class="li" data-act="delRecipe" data-id="' + esc(o.id) + '" style="color:var(--rule-red)">' + I.trash + '<span class="grow">Delete recipe</span></button></div>', 'Recipe options');
+  return sheet('<h2>Recipe options</h2><div class="list"><button class="li" data-act="sendRecipe" data-id="' + esc(o.id) + '">' + I.send + '<span class="grow">Send to someone</span></button><button class="li" data-act="copyRecipe" data-id="' + esc(o.id) + '">' + I.copy + '<span class="grow">Copy recipe as text</span></button><button class="li" data-act="dupRecipe" data-id="' + esc(o.id) + '">' + I.book + '<span class="grow">Duplicate</span></button><button class="li" data-act="delRecipe" data-id="' + esc(o.id) + '" style="color:var(--rule-red)">' + I.trash + '<span class="grow">Delete recipe</span></button></div>', 'Recipe options');
 }
 
 /* ----- editor ----- */
@@ -874,7 +910,7 @@ function sampleErr(e){
   if (c === 'prompt_too_large') return 'That’s too much text. Paste just the recipe part.';
   if (c === 'refused') return 'Claude couldn’t process that content. Try pasting just the recipe.';
   if (c === 'cancelled') return '';
-  if (e && e.message && (c === 'server' || c === 'ai_off' || c === 'offline' || c === 'auth')) return e.message;
+  if (e && e.message && (c === 'server' || c === 'ai_off' || c === 'offline' || c === 'auth' || c === 'limit')) return e.message;
   return 'Something went wrong reaching Claude. Try again.';
 }
 
@@ -1061,20 +1097,57 @@ const A = {
   async pasteUrl(){ try { const t = await navigator.clipboard.readText(); const u = (t.match(/https?:\/\/\S+/) || [t])[0].trim(); S.drafts['im-url'] = u; render(); } catch (e) { toast('Couldn’t read the clipboard. Long-press the box and tap Paste.'); } },
   install(){ if (!installEvt) return; installEvt.prompt(); installEvt.userChoice.finally(() => { installEvt = null; render(); }); },
   hideInstall(){ lsSet('hideInstall', true); render(); },
-  async login(){
-    const p = (S.drafts['pass'] || '').trim();
-    if (S.setup) { if (p.length < 4) { S.loginErr = 'Use at least 4 characters.'; render(); return; } if (p !== (S.drafts['pass2'] || '').trim()) { S.loginErr = 'The two passcodes don’t match.'; render(); return; } }
-    else if (!p) { S.loginErr = 'Type the passcode.'; render(); return; }
-    S.loginBusy = true; S.loginErr = ''; render();
-    try { const j = await api('login', { body: { passcode: p } }); TOKEN = j.token; lsSet('token', TOKEN); S.auth = 'ok'; S.loginBusy = false; clearDrafts('pass'); render(); startSync(); }
-    catch (e) { S.loginBusy = false; S.loginErr = (e && e.message) || 'Couldn’t sign in.'; render(); }
+  loginMode(d){ S.loginMode = d.v; S.loginErr = ''; S.loginMsg = ''; render(); },
+  async googleIn(){
+    S.loginErr = ''; S.loginBusy = true; render();
+    try { const { auth, mod } = await loadFirebase(); const prov = new mod.GoogleAuthProvider(); prov.setCustomParameters({ prompt: 'select_account' });
+      try { await mod.signInWithPopup(auth, prov); }
+      catch (e) { if (e && (e.code === 'auth/popup-blocked' || e.code === 'auth/operation-not-supported-in-this-environment')) await mod.signInWithRedirect(auth, prov); else throw e; } }
+    catch (e) { S.loginErr = authErr(e); }
+    S.loginBusy = false; render();
   },
-  changePass(){ clearDrafts('np'); S.ov.push({ type: 'newPass' }); render(); },
-  async savePass(){
-    const p = (S.drafts['np1'] || '').trim(); if (p.length < 4) { toast('Use at least 4 characters.'); return; } if (p !== (S.drafts['np2'] || '').trim()) { toast('The two passcodes don’t match.'); return; }
-    try { const j = await api('passcode', { body: { passcode: p } }); TOKEN = j.token; lsSet('token', TOKEN); S.ov.pop(); clearDrafts('np'); toast('Passcode changed. Other phones will need the new one.'); render(); } catch (e) { toast((e && e.message) || 'Couldn’t change it.'); }
+  async emailIn(){
+    const m = S.loginMode; const email = (S.drafts['lg-email'] || '').trim(); const pass = S.drafts['lg-pass'] || ''; const name = (S.drafts['lg-name'] || '').trim();
+    S.loginErr = ''; S.loginMsg = '';
+    if (!/^\S+@\S+\.\S+$/.test(email)) { S.loginErr = 'Type your email address.'; render(); return; }
+    if (m === 'signup' && !name) { S.loginErr = 'Type your name so people in your kitchen know who you are.'; render(); return; }
+    if (m !== 'reset' && pass.length < 6) { S.loginErr = 'Passwords need at least 6 characters.'; render(); return; }
+    S.loginBusy = true; render();
+    try {
+      const { auth, mod } = await loadFirebase();
+      if (m === 'reset') { await mod.sendPasswordResetEmail(auth, email); S.loginMsg = 'Check your email for a link to set a new password.'; S.loginMode = 'signin'; }
+      else if (m === 'signup') { const cred = await mod.createUserWithEmailAndPassword(auth, email, pass); await mod.updateProfile(cred.user, { displayName: name }); await cred.user.getIdToken(true); await loadMe(); }
+      else await mod.signInWithEmailAndPassword(auth, email, pass);
+    } catch (e) { S.loginErr = authErr(e); }
+    S.loginBusy = false; render();
   },
-  signOut(){ TOKEN = ''; lsSet('token', ''); lsSet('cache', null); S.auth = 'login'; S.setup = false; S.recipes = []; S.cookbooks = []; S.plan = []; S.groceries = []; S.settings = {}; render(); },
+  async signOut(){ try { const { auth, mod } = await loadFirebase(); await mod.signOut(auth); } catch (e) {} lsSet('cache', null); clearInterval(pollT); S.me = null; S.recipes = []; S.cookbooks = []; S.plan = []; S.groceries = []; S.settings = {}; S.ov = []; S.auth = 'login'; render(); },
+  kRename(){ setDrafts({ kn: S.me.kitchen.name }); S.ov.push({ type: 'kName' }); render(); },
+  async kRenameSave(){ const name = (S.drafts.kn || '').trim(); if (!name) { toast('Type a name.'); return; } try { await api('kitchen/rename', { body: { name } }); S.ov.pop(); await loadMe(); toast('Kitchen renamed'); } catch (e) { toast(e.message || 'Couldn’t rename.'); } },
+  async kInvite(){
+    const link = location.origin + '/?join=' + S.me.kitchen.inviteCode;
+    const text = 'Join my kitchen on Pickett Pantry so we share recipes and the grocery list: ' + link;
+    try { if (navigator.share) { await navigator.share({ title: 'Join my kitchen', text, url: link }); return; } } catch (e) { if (e && e.name === 'AbortError') return; }
+    copyText(link); toast('Invite link copied');
+  },
+  kLeave(){ confirmBox('Leave ' + S.me.kitchen.name + '?', 'You’ll start a new, empty kitchen of your own. The recipes stay here with the others.', 'Leave', async () => { try { await api('kitchen/leave', { body: {} }); await loadMe(); await loadAll(); toast('You have your own kitchen now'); } catch (e) { toast(e.message || 'Couldn’t leave.'); } }, true); },
+  kRemove(d){ const p = S.me.kitchen.members.find(x => x.uid === d.id); confirmBox('Remove ' + (p ? p.name : 'this person') + '?', 'They’ll lose access to this kitchen’s recipes and lists. Their next visit starts them a kitchen of their own.', 'Remove', async () => { try { await api('kitchen/remove', { body: { uid: d.id } }); await loadMe(); toast('Removed'); } catch (e) { toast(e.message || 'Couldn’t remove.'); } }, true); },
+  async kJoin(){ const o = top(); o.busy = true; render(); try { await api('kitchen/join', { body: { code: o.code } }); S.ov.pop(); await loadMe(); await loadAll(); toast('You joined ' + o.kitchenName); } catch (e) { o.busy = false; render(); toast(e.message || 'Couldn’t join.'); } },
+  async sendRecipe(d){
+    const r = recipe(d.id); if (!r) return; S.ov.pop(); render();
+    try {
+      const j = await api('share', { body: { recipe: strip(r) } });
+      const link = location.origin + '/?recipe=' + j.id;
+      try { if (navigator.share) { await navigator.share({ title: r.title, text: r.title + ' (open to save it in Pickett Pantry)', url: link }); return; } } catch (e) { if (e && e.name === 'AbortError') return; }
+      copyText(link); toast('Recipe link copied');
+    } catch (e) { toast(e.message || 'Couldn’t create a link.'); }
+  },
+  async saveShared(){
+    const o = top(); o.busy = true; render();
+    const rec = Object.assign({}, clone(o.recipe), { cookbookIds: [], cookLog: [], createdAt: Date.now(), updatedAt: Date.now(), notes: [o.recipe.notes, o.from ? 'Shared by ' + o.from : ''].filter(Boolean).join('\n') });
+    const id = uid();
+    try { await put('recipes', id, rec); S.ov.pop(); S.ov.push({ type: 'recipe', id }); toast('Saved to your recipes'); render(); } catch (e) { o.busy = false; render(); }
+  },
   edCb(d){ const o = top(); const s = new Set(o.cookbookIds || []); s.has(d.id) ? s.delete(d.id) : s.add(d.id); o.cookbookIds = Array.from(s); render(); },
   edNoPhoto(){ top().imageId = null; render(); },
   async edPhoto(d, el){
@@ -1296,7 +1369,7 @@ document.addEventListener('visibilitychange', () => { const o = top(); if (docum
 let installEvt = null;
 window.addEventListener('beforeinstallprompt', e => { e.preventDefault(); installEvt = e; render(); });
 window.addEventListener('appinstalled', () => { installEvt = null; toast('Installed. Look for Pickett Pantry in your Share menu.'); render(); });
-document.addEventListener('submit', ev => { if (ev.target.dataset.form === 'login') { ev.preventDefault(); A.login(); } });
+document.addEventListener('submit', ev => { if (ev.target.dataset.form === 'login') { ev.preventDefault(); A.emailIn(); } });
 
 async function loadAll(){
   const j = await api('data');
@@ -1312,9 +1385,10 @@ async function poll(){
 }
 async function startSync(){
   const cache = lsGet('cache', null);
-  if (cache && cache.recipes) { Object.assign(S, { recipes: cache.recipes, cookbooks: cache.cookbooks || [], plan: cache.plan || [], groceries: cache.groceries || [], settings: cache.settings || {} }); Object.keys(S.loaded).forEach(k => { S.loaded[k] = true; }); render(); }
+  if (cache && cache.recipes && S.me && cache.uid === S.me.user.uid) { Object.assign(S, { recipes: cache.recipes, cookbooks: cache.cookbooks || [], plan: cache.plan || [], groceries: cache.groceries || [], settings: cache.settings || {} }); Object.keys(S.loaded).forEach(k => { S.loaded[k] = true; }); render(); }
   try { await loadAll(); } catch (e) { if (e && e.code === 'auth') return; }
   clearInterval(pollT); pollT = setInterval(poll, 15000);
+  await handlePending();
   await handleShare();
 }
 document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') poll(); });
@@ -1334,7 +1408,7 @@ async function handleShare(){
   let shared = null;
   if (q.has('shared')) shared = await readShareInbox();
   if (!shared && (q.get('url') || q.get('text'))) shared = { title: q.get('title') || '', text: q.get('text') || '', url: q.get('url') || '', files: [] };
-  if (q.toString()) history.replaceState(null, '', '/');
+  if (q.has('shared') || q.has('url') || q.has('text')) history.replaceState(null, '', '/');
   if (!shared) return;
   if (!shared.url) shared.url = (String(shared.text).match(/https?:\/\/[^\s<>"']+/) || [''])[0].replace(/[).,]+$/, '');
   if (!shared.url && !(shared.files || []).length && String(shared.text).trim().length < 20) { toast('Nothing to import in what was shared.'); return; }
@@ -1343,11 +1417,61 @@ async function handleShare(){
   A.runImport();
 }
 
+function authErr(e){
+  const c = (e && e.code) || '';
+  if (c === 'auth/popup-closed-by-user' || c === 'auth/cancelled-popup-request') return '';
+  if (c === 'auth/invalid-credential' || c === 'auth/wrong-password' || c === 'auth/user-not-found' || c === 'auth/invalid-login-credentials') return 'That email and password don’t match. Try again, or tap Forgot password.';
+  if (c === 'auth/email-already-in-use') return 'There’s already an account with that email. Sign in instead.';
+  if (c === 'auth/weak-password') return 'Pick a longer password (at least 6 characters).';
+  if (c === 'auth/invalid-email') return 'That email address doesn’t look right.';
+  if (c === 'auth/too-many-requests') return 'Too many tries. Wait a few minutes and try again.';
+  if (c === 'auth/network-request-failed') return 'No connection. Check your internet and try again.';
+  if (c === 'auth/unauthorized-domain') return 'This web address isn’t allowed in Firebase yet. Add it under Authentication, Settings, Authorized domains.';
+  if (c === 'auth/operation-not-allowed') return 'That sign-in method isn’t switched on in Firebase yet.';
+  return 'Couldn’t sign in. Try again.';
+}
+async function loadMe(){ try { S.me = await api('me'); render(); } catch (e) {} }
+let signedInUid = null;
+async function signedIn(user){
+  if (signedInUid === user.uid) return;
+  signedInUid = user.uid; S.auth = 'ok'; S.pendingNote = ''; render();
+  await loadMe();
+  await startSync();
+}
+// links like ?join=CODE or ?recipe=ID survive the sign-in step
+const PENDING = (() => {
+  const q = new URLSearchParams(location.search); const p = {};
+  if (q.get('join')) p.join = q.get('join'); if (q.get('recipe')) p.recipe = q.get('recipe');
+  if (p.join || p.recipe) { try { sessionStorage.setItem('pp_pending', JSON.stringify(p)); } catch (e) {} history.replaceState(null, '', '/' + (q.has('shared') ? '?shared=1' : '')); return p; }
+  try { return JSON.parse(sessionStorage.getItem('pp_pending') || 'null') || {}; } catch (e) { return {}; }
+})();
+async function handlePending(){
+  const p = Object.assign({}, PENDING); Object.keys(PENDING).forEach(k => delete PENDING[k]);
+  try { sessionStorage.removeItem('pp_pending'); } catch (e) {}
+  if (p.join) {
+    try { const j = await api('kitchen/invite/' + encodeURIComponent(p.join)); if (j.already) toast('You’re already in ' + j.kitchenName); else { S.ov.push({ type: 'join', code: p.join, kitchenName: j.kitchenName, ownerName: j.ownerName }); render(); } }
+    catch (e) { toast(e.message || 'That invite link didn’t work.'); }
+  }
+  if (p.recipe) {
+    try { const j = await api('share/' + encodeURIComponent(p.recipe), { noAuth: true }); S.ov.push({ type: 'sharedRecipe', recipe: j.recipe, from: j.from }); render(); }
+    catch (e) { toast(e.message || 'That recipe link didn’t work.'); }
+  }
+}
+
 (async function boot(){
   if ('serviceWorker' in navigator) { try { await navigator.serviceWorker.register('/sw.js'); } catch (e) {} }
-  if (TOKEN) { S.auth = 'ok'; render(); startSync(); return; }
-  try { const st = await api('status'); S.setup = !!st.setup; S.aiOn = !!st.ai; } catch (e) {}
-  S.auth = 'login'; render();
+  if (PENDING.join) S.pendingNote = 'Sign in or create an account to join the kitchen you were invited to.';
+  else if (PENDING.recipe) S.pendingNote = 'Sign in or create an account to save the recipe someone sent you.';
+  const cfg = window.FIREBASE_CONFIG || {};
+  if (!cfg.apiKey || /REPLACE/.test(cfg.apiKey)) { S.auth = 'unconfigured'; render(); return; }
+  try {
+    const { auth, mod } = await loadFirebase();
+    mod.getRedirectResult(auth).catch(e => { S.loginErr = authErr(e); render(); });
+    mod.onAuthStateChanged(auth, user => {
+      if (user) signedIn(user);
+      else { signedInUid = null; S.auth = 'login'; render(); }
+    });
+  } catch (e) { S.auth = 'login'; S.loginErr = 'Couldn’t load sign-in. Check your connection and reload.'; render(); }
 })();
 })();
 </script>
