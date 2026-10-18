@@ -825,7 +825,9 @@ function vRMenu(o){
 function vEditor(o){
   const cbs = S.cookbooks.slice().sort((a, b) => String(a.title).localeCompare(String(b.title)));
   let h = '<div class="ov" data-scroll="editor"><div class="ov-in">' + bar(o.rid ? 'Edit recipe' : (o.imported ? 'Check the import' : 'New recipe'), '<button class="btn primary" data-act="saveEditor"' + (o.busy ? ' disabled' : '') + '>' + (o.busy ? '<span class="spin"></span>' : '') + 'Save</button>');
-  if (o.imported) h += '<div class="banner"><div>Claude filled this in. Look it over, fix anything that’s off, then tap Save.</div></div>';
+  if (o.imported) h += o.method === 'rough'
+    ? '<div class="banner warn"><div>The recipe helper couldn’t tidy this one, so here’s the post’s text sorted as well as we could. Check the ingredients and steps, move anything that’s in the wrong box, then tap Save.</div></div>'
+    : '<div class="banner"><div>Claude filled this in. Look it over, fix anything that’s off, then tap Save.</div></div>';
   h += '<div style="display:grid;gap:16px">';
   // photo (only when this page has photo storage)
   if (ASSETS) h += '<div class="field"><span class="lbl">Photo</span><div class="row">' + (o.imageId ? '<div class="thumb" style="width:140px"><img alt="" src="' + esc(imgUrl(o.imageId)) + '"></div>' : '') +

@@ -85,12 +85,16 @@ async function usage(kid: string, k: Kitchen) {
   const unlimited = await isUnlimited(k);
   return { used: u.count, limit: unlimited ? null : AI_MONTHLY_LIMIT };
 }
-async function spendAi(kid: string, k: Kitchen) {
+async function canSpendAi(kid: string, k: Kitchen) {
   const u = await usage(kid, k);
-  if (u.limit != null && u.used >= u.limit) return false;
-  await putJSON(`k/${kid}/usage/${monthKey()}`, { count: u.used + 1 });
-  return true;
+  return !(u.limit != null && u.used >= u.limit);
 }
+async function recordAi(kid: string, k: Kitchen) {
+  const u = await usage(kid, k);
+  await putJSON(`k/${kid}/usage/${monthKey()}`, { count: u.used + 1 });
+}
+const BUSY_MSG = "The recipe helper is busy right now. Try again in a minute.";
+const BUSY_MSG_PHOTO = "Reading photos isn’t working right now. Try again in a minute, or paste the recipe text instead.";
 const LIMIT_MSG = "Your kitchen has used all of this month’s Claude imports. Recipe website links still work, and the count resets on the 1st.";
 
 async function bump(kid: string) { await store().set(`k/${kid}/rev`, Date.now().toString(36) + randomBytes(3).toString("hex")); }
@@ -114,10 +118,27 @@ async function memberList(k: Kitchen) {
 }
 
 /* ---------------- Claude ---------------- */
-let client: Anthropic | null = null;
+// Netlify's AI Gateway provides the key. Read it fresh on every call (it is set when the
+// function starts up) and fall back to the gateway's own variables if the Anthropic ones are missing.
+function envVar(name: string): string {
+  const g: any = globalThis as any;
+  try { const v = g.Netlify?.env?.get?.(name); if (v) return String(v); } catch {}
+  return process.env[name] || "";
+}
+function aiCreds() {
+  const key = envVar("ANTHROPIC_API_KEY") || envVar("NETLIFY_AI_GATEWAY_KEY");
+  let base = envVar("ANTHROPIC_BASE_URL");
+  if (!base && envVar("NETLIFY_AI_GATEWAY_URL")) base = envVar("NETLIFY_AI_GATEWAY_URL").replace(/\/$/, "") + "/anthropic";
+  return { key, base };
+}
+let client: Anthropic | null = null; let clientKey = "";
 function claude() {
-  if (!process.env.ANTHROPIC_API_KEY) return null;
-  client ??= new Anthropic();
+  const { key, base } = aiCreds();
+  if (!key) {
+    console.error("AI unavailable: no key. Present:", ["ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "NETLIFY_AI_GATEWAY_KEY", "NETLIFY_AI_GATEWAY_URL"].filter((n) => !!envVar(n)).join(",") || "none");
+    return null;
+  }
+  if (!client || clientKey !== key) { client = new Anthropic({ apiKey: key, ...(base ? { baseURL: base } : {}) }); clientKey = key; }
   return client;
 }
 async function ask(content: any, maxTokens = 3000, system?: string): Promise<string> {
@@ -146,7 +167,37 @@ function fromAi(j: any, src: string) {
     notes: j.notes || "", sourceUrl: src || "",
   };
 }
-async function structure(text: string, src: string, images: { media_type: string; data: string }[] = []) {
+/** Rough recipe from plain text, used when Claude can't be reached. */
+function roughRecipe(text: string, src: string) {
+  const lines = String(text || "").split(/\r?\n|(?<=[.!?])\s+(?=\d+[.)]\s)/).map((l) => l.replace(/#[\w-]+/g, "").replace(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/gu, "").trim()).filter(Boolean);
+  const ingredients: string[] = []; const steps: string[] = []; const rest: string[] = [];
+  let mode = "";
+  for (const l of lines) {
+    if (/^(ingredients?|you('|’)ll need|what you need)\s*:?$/i.test(l)) { mode = "i"; continue; }
+    if (/^(instructions?|directions?|method|steps|how to make( it)?)\s*:?$/i.test(l)) { mode = "s"; continue; }
+    if (/^\d+[.)]\s+/.test(l) && mode !== "i") { steps.push(l.replace(/^\d+[.)]\s+/, "")); continue; }
+    if (mode === "i" || /^[-•*▢]\s*/.test(l) || /^(\d+([\/.]\d+)?|[½⅓⅔¼¾])\s*(cups?|tbsp|tsp|tablespoons?|teaspoons?|oz|ounces?|lbs?|pounds?|g|grams?|kg|ml|l|cloves?|cans?|pinch)?\b/i.test(l)) { ingredients.push(l.replace(/^[-•*▢]\s*/, "")); continue; }
+    if (mode === "s") { steps.push(l); continue; }
+    rest.push(l);
+  }
+  const first = rest[0] || lines[0] || "Imported recipe";
+  const title = (first.split(/(?<=[!.?])\s/)[0] || first).replace(/[!.:?]+$/, "").slice(0, 70);
+  const nothingSorted = !ingredients.length && !steps.length;
+  const notes = (nothingSorted ? lines : rest.slice(1)).join("\n").slice(0, 4000);
+  return { title, description: "", servings: null, prepMin: null, cookMin: null, cuisine: "", tags: [], ingredients, steps, notes, sourceUrl: src || "" };
+}
+
+async function structure(text: string, src: string, images: { media_type: string; data: string }[] = []): Promise<{ recipe: any; ai: boolean } | null> {
+  try {
+    const r = await structureAi(text, src, images);
+    return r ? { recipe: r, ai: true } : null;
+  } catch (e: any) {
+    console.error("Claude call failed:", e?.message || e);
+    if (images.length || !text) throw new Error("ai_unavailable");
+    return { recipe: roughRecipe(text, src), ai: false };
+  }
+}
+async function structureAi(text: string, src: string, images: { media_type: string; data: string }[] = []) {
   const content: any[] = images.map((im) => ({ type: "image", source: { type: "base64", media_type: im.media_type, data: im.data } }));
   content.push({ type: "text", text: IMPORT_RULES + (src ? `\nSource link: ${src}` : "") + (images.length ? "\nThe images are photos or screenshots of one recipe, in page order." : "") + (text ? `\nContent:\n"""\n${text.slice(0, 50000)}\n"""` : "") });
   const j = parseJsonReply(await ask(content, 4000));
@@ -218,18 +269,19 @@ async function lookUp(url: string): Promise<Found> {
   return { caption: htmlToText(g.text), imageUrl: getMeta(g.text, "og:image"), finalUrl: g.url, platform };
 }
 
-async function importRecipe(body: any, spend: () => Promise<boolean>) {
+async function importRecipe(body: any, ai: { can: () => Promise<boolean>; used: () => Promise<void> }) {
   const shared = String(body.text || "");
   const url = String(body.url || "").trim() || firstUrl(shared);
   const extra = shared.replace(url, "").trim();
   const images = Array.isArray(body.images) ? body.images.slice(0, 6) : [];
+  const finish = async (res: { recipe: any; ai: boolean } | null) => { if (res?.ai) await ai.used(); return res; };
 
   if (images.length) {
     const parsed = images.map((d: string) => { const m = String(d).match(/^data:(image\/(?:jpeg|png|webp|gif));base64,(.+)$/); return m ? { media_type: m[1], data: m[2] } : null; }).filter(Boolean);
     if (!parsed.length) return { error: "Those images couldn’t be read. Try JPG or PNG." };
-    if (!(await spend())) return { error: LIMIT_MSG, limit: true };
-    const r = await structure(extra, url, parsed as any);
-    return r ? { recipe: r, method: "photo" } : { error: "Claude couldn’t find a recipe in those images." };
+    if (!(await ai.can())) return { error: LIMIT_MSG, limit: true };
+    let r; try { r = await finish(await structure(extra, url, parsed as any)); } catch { return { error: BUSY_MSG_PHOTO }; }
+    return r ? { recipe: r.recipe, method: "photo" } : { error: "Couldn’t find a recipe in those images. Make sure the ingredients and steps are visible." };
   }
   if (url) {
     if (platformOf(url) === "invalid") return { error: "That link doesn’t look right." };
@@ -245,17 +297,17 @@ async function importRecipe(body: any, spend: () => Promise<boolean>) {
     if (text.replace(/\s/g, "").length < 40) {
       return { error: found.platform === "web" ? "That page didn’t include a readable recipe. Paste the recipe text instead." : "That post’s caption couldn’t be read (the account may be private, or the recipe is only in the video). Take a screenshot of the recipe and share that instead.", url: found.finalUrl };
     }
-    if (!(await spend())) return { error: LIMIT_MSG, limit: true, url: found.finalUrl };
-    const r = await structure(text, found.finalUrl || url);
-    if (!r) return { error: found.platform === "web" ? "Claude couldn’t find a recipe on that page." : "That post doesn’t have the recipe written in its caption. If it’s only in the video, take a screenshot of the recipe and share that instead.", url: found.finalUrl };
-    if (!r.notes && found.author) r.notes = "Recipe by " + found.author;
+    if (!(await ai.can())) return { error: LIMIT_MSG, limit: true, url: found.finalUrl };
+    const r = await finish(await structure(text, found.finalUrl || url));
+    if (!r) return { error: found.platform === "web" ? "Couldn’t find a recipe on that page." : "That post doesn’t have the recipe written in its caption. If it’s only in the video, take a screenshot of the recipe and share that instead.", url: found.finalUrl };
+    if (!r.recipe.notes && found.author) r.recipe.notes = "Recipe by " + found.author;
     const imageId = await savePhotoFromUrl(found.imageUrl || "");
-    return { recipe: { ...r, imageId }, method: "caption" };
+    return { recipe: { ...r.recipe, imageId }, method: r.ai ? "caption" : "rough" };
   }
   if (extra.length >= 20) {
-    if (!(await spend())) return { error: LIMIT_MSG, limit: true };
-    const r = await structure(extra, "");
-    return r ? { recipe: r, method: "text" } : { error: "Claude couldn’t find a recipe in that text." };
+    if (!(await ai.can())) return { error: LIMIT_MSG, limit: true };
+    const r = await finish(await structure(extra, ""));
+    return r ? { recipe: r.recipe, method: r.ai ? "text" : "rough" } : { error: "Couldn’t find a recipe in that text." };
   }
   return { error: "Share a link, some recipe text, or a screenshot." };
 }
@@ -388,7 +440,7 @@ export default async (req: Request, _ctx: Context) => {
 
     if (path[0] === "import" && method === "POST") {
       const body = await req.json().catch(() => ({}));
-      const res: any = await importRecipe(body, () => spendAi(kid, kitchen));
+      const res: any = await importRecipe(body, { can: () => canSpendAi(kid, kitchen), used: () => recordAi(kid, kitchen) });
       res.usage = await usage(kid, kitchen);
       return json(res);
     }
@@ -401,15 +453,16 @@ export default async (req: Request, _ctx: Context) => {
       for (let i = messages.length - 1; i > 0; i--) if (messages[i].role === messages[i - 1].role) { messages[i - 1] = { role: messages[i].role, content: messages[i - 1].content + "\n\n" + messages[i].content }; messages.splice(i, 1); }
       if (messages[0].role !== "user") messages.shift();
       if (JSON.stringify(messages).length > 120_000) return fail("That’s too much text.");
-      if (!(await spendAi(kid, kitchen))) return fail(LIMIT_MSG, 429, { limit: true });
+      if (!(await canSpendAi(kid, kitchen))) return fail(LIMIT_MSG, 429, { limit: true });
       const text = await ask(messages, Math.min(Number(body.maxTokens) || 1500, 3000), typeof body.system === "string" ? body.system.slice(0, 20000) : undefined);
+      await recordAi(kid, kitchen);
       if (body.json) { const j = parseJsonReply(text); if (j == null) return fail("Claude’s answer didn’t come back in a usable form. Try again.", 502); return json({ data: j }); }
       return json({ text });
     }
 
     return fail("Not found", 404);
   } catch (e: any) {
-    if (e?.message === "ai_unavailable") return fail("Claude isn’t switched on for this site yet. In Netlify, check that AI features are enabled, then redeploy.", 503);
+    if (e?.message === "ai_unavailable" || e?.status >= 500 || e?.status === 429 || /overloaded|rate/i.test(String(e?.message || ""))) { console.error("AI error:", e?.status, e?.message); return fail(BUSY_MSG, 503); }
     console.error(e);
     return fail("Something went wrong on the server. Try again.", 500);
   }
