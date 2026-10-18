@@ -303,7 +303,7 @@ async function importRecipe(body: any, ai: { can: () => Promise<boolean>; used: 
     }
     if (!(await ai.can())) return { error: LIMIT_MSG, limit: true, url: found.finalUrl };
     const r = await finish(await structure(text, found.finalUrl || url));
-    if (!r || !r.recipe) return { needsDish: true, dish: r?.dish || cleanDish(found.caption || ""), url: found.finalUrl, reason: found.platform === "web" ? "That page didn’t include a readable recipe." : "That post doesn’t include the written recipe." };
+    if (!r || isEmptyRecipe(r.recipe)) return { needsDish: true, dish: r?.dish || cleanDish(found.caption || ""), url: found.finalUrl, reason: found.platform === "web" ? "That page didn’t include a readable recipe." : "That post doesn’t include the written recipe." };
     if (!r.recipe.notes && found.author) r.recipe.notes = "Recipe by " + found.author;
     const imageId = await savePhotoFromUrl(found.imageUrl || "");
     return { recipe: { ...r.recipe, imageId }, method: r.ai ? "caption" : "rough" };
@@ -311,7 +311,7 @@ async function importRecipe(body: any, ai: { can: () => Promise<boolean>; used: 
   if (extra.length >= 20) {
     if (!(await ai.can())) return { error: LIMIT_MSG, limit: true };
     const r = await finish(await structure(extra, ""));
-    if (r && !r.recipe) return { needsDish: true, dish: r.dish || "", reason: "That text doesn’t include a written recipe." };
+    if (r && isEmptyRecipe(r.recipe)) return { needsDish: true, dish: r.dish || cleanDish(extra), reason: "That text doesn’t include a written recipe." };
     return r ? { recipe: r.recipe, method: r.ai ? "text" : "rough" } : { error: "Couldn’t find a recipe in that text." };
   }
   return { error: "Share a link, some recipe text, or a screenshot." };
@@ -319,8 +319,13 @@ async function importRecipe(body: any, ai: { can: () => Promise<boolean>; used: 
 
 /* ---------------- finding recipes by name ---------------- */
 function cleanDish(s: string) {
-  return String(s || "").replace(/#[\w-]+/g, "").replace(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/gu, "").split(/[\n.!?|]/)[0].trim().slice(0, 60);
+  let d = String(s || "").replace(/#[\w-]+/g, "").replace(/@[\w.]+/g, "").replace(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/gu, "").split(/[\n.!?|]/)[0];
+  d = d.replace(/\b(full\s+)?recipe\b.*$/i, "").replace(/\b(link in bio|on my (website|blog|site)|check (out )?my).*$/i, "");
+  d = d.replace(/^\s*(the\s+)?(best|easiest|easy|perfect|my|ultimate|amazing|simple|quick|homemade|favorite)\s+(ever\s+)?/i, "").replace(/^\s*(the\s+)?(best|easiest|easy|perfect|ultimate)\s+/i, "");
+  return d.replace(/\s+/g, " ").trim().slice(0, 60);
 }
+/** A fallback recipe with no ingredients or steps isn't a recipe; ask for the dish instead. */
+const isEmptyRecipe = (r: any) => !r || (!(r.ingredients || []).length && !(r.steps || []).length);
 const DIET_SET = ["vegan", "vegetarian", "dairy-free", "gluten-free", "keto", "low-carb", "nut-free", "high-protein"];
 const BLOCKED_HOSTS = /(youtube|youtu\.be|tiktok|instagram|facebook|pinterest|reddit|twitter|x\.com|amazon)\./i;
 
@@ -410,7 +415,15 @@ export default async (req: Request, _ctx: Context) => {
       if (!r) return new Response("not found", { status: 404 });
       return new Response(r.data as ArrayBuffer, { headers: { "content-type": String((r.metadata as any)?.type || "image/jpeg"), "cache-control": "public, max-age=31536000, immutable" } });
     }
-    if (path[0] === "status" && method === "GET") return json({ ai: !!process.env.ANTHROPIC_API_KEY, configured: !FIREBASE_PROJECT_ID.startsWith("REPLACE") });
+    if (path[0] === "status" && method === "GET") {
+      const out: any = { ai: !!aiCreds().key, configured: !FIREBASE_PROJECT_ID.startsWith("REPLACE"),
+        env: Object.fromEntries(["ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "NETLIFY_AI_GATEWAY_KEY", "NETLIFY_AI_GATEWAY_URL"].map((n) => [n, !!envVar(n)])) };
+      if (url.searchParams.get("check") === "ai") {
+        try { const c = claude(); if (!c) throw new Error("no key"); const m: any = await c.messages.create({ model: MODEL, max_tokens: 5, messages: [{ role: "user", content: "Say ok" }] }); out.aiCheck = "ok: " + (m.content?.[0]?.text || "").slice(0, 20); }
+        catch (e: any) { out.aiCheck = "failed: " + (e?.status || "") + " " + String(e?.message || e).slice(0, 300); }
+      }
+      return json(out);
+    }
     if (path[0] === "share" && path[1] && method === "GET") {
       if (!ID_RE.test(path[1])) return fail("That link isn’t valid.", 404);
       const s = await getJSON<any>(`shares/${path[1]}`);
