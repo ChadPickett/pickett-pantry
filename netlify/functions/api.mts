@@ -5,7 +5,7 @@ import { createRemoteJWKSet, jwtVerify } from "jose";
 import { randomBytes } from "node:crypto";
 import {
   findJsonLdRecipe, mapJsonLd, htmlToText, platformOf, getMeta, captionFromOg,
-  youtubeDescription, firstUrl, parseJsonReply,
+  youtubeDescription, firstUrl, parseJsonReply, dietGuess, linksFrom,
 } from "../../lib/extract.mjs";
 import { FIREBASE_PROJECT_ID } from "../../lib/firebase-config.mjs";
 
@@ -156,7 +156,7 @@ Ingredients: one line each, written as "quantity unit ingredient, prep note" (fo
 Steps: one step per string, in order, without leading numbers. Section labels go in as their own line ending in a colon.
 Drop hashtags, emojis, follow-me requests, sponsor text and life stories. Put useful tips in notes.
 Reply with only this JSON: {"title":string,"description":string|null,"servings":number|null,"prepMinutes":number|null,"cookMinutes":number|null,"cuisine":string|null,"tags":[string],"ingredients":[string],"steps":[string],"notes":string|null}
-tags: up to 4 short lowercase words such as "dinner", "dessert", "vegetarian", "slow cooker". If there is no recipe in the content, reply {"error":"no recipe found"}.`;
+tags: up to 4 short lowercase words such as "dinner", "dessert", "vegetarian", "slow cooker". If the content has no written recipe (no ingredient list), reply {"error":"no recipe found","dish":"the dish it seems to be about, in 2 to 6 words, or null"}.`;
 
 function fromAi(j: any, src: string) {
   const n = (v: any) => { const x = parseFloat(v); return isFinite(x) && x > 0 ? x : null; };
@@ -187,10 +187,12 @@ function roughRecipe(text: string, src: string) {
   return { title, description: "", servings: null, prepMin: null, cookMin: null, cuisine: "", tags: [], ingredients, steps, notes, sourceUrl: src || "" };
 }
 
-async function structure(text: string, src: string, images: { media_type: string; data: string }[] = []): Promise<{ recipe: any; ai: boolean } | null> {
+async function structure(text: string, src: string, images: { media_type: string; data: string }[] = []): Promise<{ recipe: any; ai: boolean; dish?: string } | null> {
   try {
-    const r = await structureAi(text, src, images);
-    return r ? { recipe: r, ai: true } : null;
+    const r: any = await structureAi(text, src, images);
+    if (!r) return null;
+    if (r.noRecipe) return { recipe: null, ai: true, dish: String(r.dish || "").slice(0, 80) };
+    return { recipe: r, ai: true };
   } catch (e: any) {
     console.error("Claude call failed:", e?.message || e);
     if (images.length || !text) throw new Error("ai_unavailable");
@@ -201,7 +203,8 @@ async function structureAi(text: string, src: string, images: { media_type: stri
   const content: any[] = images.map((im) => ({ type: "image", source: { type: "base64", media_type: im.media_type, data: im.data } }));
   content.push({ type: "text", text: IMPORT_RULES + (src ? `\nSource link: ${src}` : "") + (images.length ? "\nThe images are photos or screenshots of one recipe, in page order." : "") + (text ? `\nContent:\n"""\n${text.slice(0, 50000)}\n"""` : "") });
   const j = parseJsonReply(await ask(content, 4000));
-  if (!j || j.error || !j.title) return null;
+  if (!j) return null;
+  if (j.error || !j.title || !(Array.isArray(j.ingredients) && j.ingredients.length)) return { noRecipe: true, dish: typeof j.dish === "string" ? j.dish : (j.title || "") };
   return fromAi(j, src);
 }
 
@@ -274,13 +277,14 @@ async function importRecipe(body: any, ai: { can: () => Promise<boolean>; used: 
   const url = String(body.url || "").trim() || firstUrl(shared);
   const extra = shared.replace(url, "").trim();
   const images = Array.isArray(body.images) ? body.images.slice(0, 6) : [];
-  const finish = async (res: { recipe: any; ai: boolean } | null) => { if (res?.ai) await ai.used(); return res; };
+  const finish = async (res: { recipe: any; ai: boolean; dish?: string } | null) => { if (res?.ai) await ai.used(); return res; };
 
   if (images.length) {
     const parsed = images.map((d: string) => { const m = String(d).match(/^data:(image\/(?:jpeg|png|webp|gif));base64,(.+)$/); return m ? { media_type: m[1], data: m[2] } : null; }).filter(Boolean);
     if (!parsed.length) return { error: "Those images couldn’t be read. Try JPG or PNG." };
     if (!(await ai.can())) return { error: LIMIT_MSG, limit: true };
     let r; try { r = await finish(await structure(extra, url, parsed as any)); } catch { return { error: BUSY_MSG_PHOTO }; }
+    if (r && !r.recipe) return { needsDish: true, dish: r.dish || "", url, reason: "Those images don’t show a written recipe." };
     return r ? { recipe: r.recipe, method: "photo" } : { error: "Couldn’t find a recipe in those images. Make sure the ingredients and steps are visible." };
   }
   if (url) {
@@ -295,11 +299,11 @@ async function importRecipe(body: any, ai: { can: () => Promise<boolean>; used: 
     }
     const text = [found.caption, extra].filter(Boolean).join("\n\n");
     if (text.replace(/\s/g, "").length < 40) {
-      return { error: found.platform === "web" ? "That page didn’t include a readable recipe. Paste the recipe text instead." : "That post’s caption couldn’t be read (the account may be private, or the recipe is only in the video). Take a screenshot of the recipe and share that instead.", url: found.finalUrl };
+      return { needsDish: true, dish: cleanDish(found.caption || ""), url: found.finalUrl, reason: found.platform === "web" ? "That page didn’t include a readable recipe." : "That post doesn’t include a written recipe we could read." };
     }
     if (!(await ai.can())) return { error: LIMIT_MSG, limit: true, url: found.finalUrl };
     const r = await finish(await structure(text, found.finalUrl || url));
-    if (!r) return { error: found.platform === "web" ? "Couldn’t find a recipe on that page." : "That post doesn’t have the recipe written in its caption. If it’s only in the video, take a screenshot of the recipe and share that instead.", url: found.finalUrl };
+    if (!r || !r.recipe) return { needsDish: true, dish: r?.dish || cleanDish(found.caption || ""), url: found.finalUrl, reason: found.platform === "web" ? "That page didn’t include a readable recipe." : "That post doesn’t include the written recipe." };
     if (!r.recipe.notes && found.author) r.recipe.notes = "Recipe by " + found.author;
     const imageId = await savePhotoFromUrl(found.imageUrl || "");
     return { recipe: { ...r.recipe, imageId }, method: r.ai ? "caption" : "rough" };
@@ -307,9 +311,89 @@ async function importRecipe(body: any, ai: { can: () => Promise<boolean>; used: 
   if (extra.length >= 20) {
     if (!(await ai.can())) return { error: LIMIT_MSG, limit: true };
     const r = await finish(await structure(extra, ""));
+    if (r && !r.recipe) return { needsDish: true, dish: r.dish || "", reason: "That text doesn’t include a written recipe." };
     return r ? { recipe: r.recipe, method: r.ai ? "text" : "rough" } : { error: "Couldn’t find a recipe in that text." };
   }
   return { error: "Share a link, some recipe text, or a screenshot." };
+}
+
+/* ---------------- finding recipes by name ---------------- */
+function cleanDish(s: string) {
+  return String(s || "").replace(/#[\w-]+/g, "").replace(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/gu, "").split(/[\n.!?|]/)[0].trim().slice(0, 60);
+}
+const DIET_SET = ["vegan", "vegetarian", "dairy-free", "gluten-free", "keto", "low-carb", "nut-free", "high-protein"];
+const BLOCKED_HOSTS = /(youtube|youtu\.be|tiktok|instagram|facebook|pinterest|reddit|twitter|x\.com|amazon)\./i;
+
+async function searchWithClaude(dish: string): Promise<{ urls: string[]; ai: boolean }> {
+  const c = claude(); if (!c) return { urls: [], ai: false };
+  try {
+    const msg: any = await c.messages.create({
+      model: MODEL, max_tokens: 1500,
+      tools: [{ type: "web_search_20250305", name: "web_search", max_uses: 2 }] as any,
+      messages: [{ role: "user", content: `Search the web for well-reviewed home-cook recipes for "${dish}" on recipe websites or food blogs. Skip YouTube, TikTok, Instagram, Facebook, Pinterest and Reddit. Reply with only a JSON array of up to 8 recipe page URLs, best first.` }],
+    } as any);
+    const text = (msg.content || []).map((b: any) => (b.type === "text" ? b.text : "")).join("");
+    const arr = parseJsonReply(text);
+    const urls = (Array.isArray(arr) ? arr : []).filter((u: any) => typeof u === "string" && /^https?:\/\//.test(u) && !BLOCKED_HOSTS.test(u));
+    return { urls, ai: true };
+  } catch (e: any) { console.error("Claude web search failed:", e?.status, e?.message); return { urls: [], ai: false }; }
+}
+
+async function searchRecipeSites(dish: string): Promise<string[]> {
+  const q = encodeURIComponent(dish);
+  const sites: [string, RegExp][] = [
+    [`https://www.allrecipes.com/search?q=${q}`, /https:\/\/www\.allrecipes\.com\/recipe\/\d+\/[a-z0-9-]+\/?/g],
+    [`https://www.food.com/search/${q}`, /https:\/\/www\.food\.com\/recipe\/[a-z0-9-]+-\d+/g],
+    [`https://www.budgetbytes.com/?s=${q}`, /https:\/\/www\.budgetbytes\.com\/(?!category|tag|page|wp-|about|contact|privacy|recipes)[a-z0-9-]{6,}\/(?=["'])/g],
+  ];
+  const lists = await Promise.all(sites.map(async ([u, re]) => { try { const g = await grab(u, BROWSER_UA, 8000); return linksFrom(g.text, re, 3); } catch { return []; } }));
+  const out: string[] = [];
+  for (let i = 0; i < 3; i++) for (const l of lists) if (l[i] && !out.includes(l[i])) out.push(l[i]); // take turns between sites
+  return out;
+}
+
+async function labelDiets(cands: any[]): Promise<{ lists: string[][]; ai: boolean }> {
+  const fallback = cands.map((c) => Array.from(new Set([...(c.diets || []), ...dietGuess(c.ingredients)])));
+  if (!claude()) return { lists: fallback, ai: false };
+  try {
+    const prompt = `For each recipe below, list which of these labels truly apply based on its ingredients: ${DIET_SET.join(", ")}. Be strict: only label "keto" if it has very few carbs (no sugar, flour, grains, potatoes or beans). Reply with only a JSON array with one array of labels per recipe, in order.\n\n` +
+      cands.map((c, i) => `Recipe ${i + 1}: ${c.title}\n${c.ingredients.slice(0, 40).join("\n")}`).join("\n\n");
+    const arr = parseJsonReply(await ask(prompt, 600));
+    if (!Array.isArray(arr) || arr.length !== cands.length) return { lists: fallback, ai: true };
+    return { lists: arr.map((l: any, i: number) => Array.from(new Set([...(cands[i].diets || []), ...(Array.isArray(l) ? l.map(String).filter((x: string) => DIET_SET.includes(x)) : fallback[i])]))), ai: true };
+  } catch (e: any) { console.error("Diet labels failed:", e?.message); return { lists: fallback, ai: false }; }
+}
+
+async function findRecipes(dish: string) {
+  const viaClaude = await searchWithClaude(dish);
+  let urls = viaClaude.urls;
+  if (urls.length < 4) urls = [...urls, ...(await searchRecipeSites(dish))];
+  urls = Array.from(new Set(urls)).slice(0, 10);
+  const pages = await Promise.all(urls.map(async (u) => {
+    try {
+      const g = await grab(u, BROWSER_UA, 9000);
+      const node = findJsonLdRecipe(g.text); if (!node) return null;
+      const r = mapJsonLd(node, g.url || u);
+      if (!r.title || r.ingredients.length < 3 || !r.steps.length) return null;
+      let site = ""; try { site = new URL(g.url || u).hostname.replace(/^www\./, ""); } catch {}
+      return { ...r, site };
+    } catch { return null; }
+  }));
+  const good = pages.filter(Boolean) as any[];
+  const score = (r: any) => (r.rating ? r.rating.value : 3.6) * (1 + Math.log10((r.rating?.count || 0) + 1) / 3);
+  good.sort((a, b) => score(b) - score(a));
+  const picks: any[] = [];
+  for (const r of good) { if (picks.length >= 3) break; if (!picks.some((p) => p.site === r.site)) picks.push(r); }
+  for (const r of good) { if (picks.length >= 3) break; if (!picks.includes(r) && !picks.some((p) => p.title.toLowerCase() === r.title.toLowerCase())) picks.push(r); }
+  if (!picks.length) return { results: [], ai: viaClaude.ai };
+  const diets = await labelDiets(picks);
+  return {
+    ai: viaClaude.ai || diets.ai,
+    results: picks.map((r, i) => {
+      const { imageUrl, rating, diets: _d, totalMin, site, ...recipe } = r;
+      return { title: r.title, site, url: r.sourceUrl, imageUrl, rating, totalMin, diets: diets.lists[i], recipe };
+    }),
+  };
 }
 
 /* ---------------- router ---------------- */
@@ -436,6 +520,21 @@ export default async (req: Request, _ctx: Context) => {
       const id = randomBytes(9).toString("base64url");
       await putJSON(`shares/${id}`, { recipe, from: user.name, createdAt: Date.now() });
       return json({ id });
+    }
+
+    if (path[0] === "find" && method === "POST") {
+      const body = await req.json().catch(() => ({}));
+      const dish = String(body.dish || "").trim().slice(0, 80);
+      if (dish.length < 2) return fail("Type the name of the dish.");
+      if (!(await canSpendAi(kid, kitchen))) return fail(LIMIT_MSG, 429, { limit: true });
+      const res: any = await findRecipes(dish);
+      if (res.ai) await recordAi(kid, kitchen);
+      return json({ results: res.results, usage: await usage(kid, kitchen) });
+    }
+
+    if (path[0] === "photo-from-url" && method === "POST") {
+      const body = await req.json().catch(() => ({}));
+      return json({ id: await savePhotoFromUrl(String(body.url || "")) });
     }
 
     if (path[0] === "import" && method === "POST") {

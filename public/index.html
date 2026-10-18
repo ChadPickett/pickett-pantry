@@ -210,6 +210,17 @@ textarea.inp{min-height:120px;resize:vertical;line-height:1.45}
 .gi.done .name{text-decoration:line-through;color:var(--muted);font-weight:400}
 .qty{font-variant-numeric:tabular-nums;color:var(--accent);font-weight:700;white-space:nowrap}
 
+/* recipe search tiles */
+.tiles{display:grid;gap:10px}
+.tile{display:grid;grid-template-columns:96px 1fr;gap:12px;text-align:left;border:2px solid var(--line);background:var(--card);border-radius:var(--r);padding:8px;width:100%;align-items:start}
+.tile.on{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
+.tile .pic{width:96px;height:96px;border-radius:10px;overflow:hidden;background:var(--paper);position:relative}
+.tile .pic img{width:100%;height:100%;object-fit:cover;display:block}
+.tile .tt{font-weight:700;line-height:1.25}
+.tile .meta{font-size:.82rem;color:var(--muted);display:flex;gap:8px;flex-wrap:wrap;margin-top:2px}
+.diets{display:flex;gap:4px;flex-wrap:wrap;margin-top:6px}
+.diet{font-size:.7rem;font-weight:700;background:var(--herb-soft);color:var(--herb);border-radius:999px;padding:2px 8px;text-transform:capitalize}
+
 /* cook mode */
 .cook{display:flex;flex-direction:column;min-height:100%}
 .cook .prog{height:6px;background:var(--line);border-radius:6px;overflow:hidden}
@@ -827,10 +838,11 @@ function vEditor(o){
   let h = '<div class="ov" data-scroll="editor"><div class="ov-in">' + bar(o.rid ? 'Edit recipe' : (o.imported ? 'Check the import' : 'New recipe'), '<button class="btn primary" data-act="saveEditor"' + (o.busy ? ' disabled' : '') + '>' + (o.busy ? '<span class="spin"></span>' : '') + 'Save</button>');
   if (o.imported) h += o.method === 'rough'
     ? '<div class="banner warn"><div>The recipe helper couldn’t tidy this one, so here’s the post’s text sorted as well as we could. Check the ingredients and steps, move anything that’s in the wrong box, then tap Save.</div></div>'
+    : o.method === 'found' ? '<div class="banner"><div>Recipe from <b>' + esc(o.site || 'a recipe site') + '</b>. Look it over, make it yours, then tap Save.</div></div>'
     : '<div class="banner"><div>Claude filled this in. Look it over, fix anything that’s off, then tap Save.</div></div>';
   h += '<div style="display:grid;gap:16px">';
   // photo (only when this page has photo storage)
-  if (ASSETS) h += '<div class="field"><span class="lbl">Photo</span><div class="row">' + (o.imageId ? '<div class="thumb" style="width:140px"><img alt="" src="' + esc(imgUrl(o.imageId)) + '"></div>' : '') +
+  if (ASSETS) h += '<div class="field"><span class="lbl">Photo</span><div class="row">' + (o.imageId ? '<div class="thumb" style="width:140px">' + indexCard({ title: dv('ed-title') || 'Photo' }) + '<img alt="" src="' + esc(imgUrl(o.imageId)) + '" onerror="this.remove()"></div>' : '') +
     '<label class="btn small">' + I.img + (o.imageId ? 'Change photo' : 'Add a photo') + '<input id="ed-photo" type="file" accept="image/*" class="sr" data-act-change="edPhoto"></label>' + (o.uploading ? '<span class="spin"></span>' : '') + (o.imageId ? '<button class="btn small ghost" data-act="edNoPhoto">Remove</button>' : '') + '</div></div>';
   h += '<div class="field"><label for="ed-title">Recipe name</label><input id="ed-title" class="inp" value="' + esc(dv('ed-title')) + '" placeholder="e.g. Sunday pot roast"></div>';
   h += '<div class="field"><label for="ed-desc">Short description</label><input id="ed-desc" class="inp" value="' + esc(dv('ed-desc')) + '" placeholder="Optional"></div>';
@@ -861,13 +873,33 @@ function vAdd(){
   h += opt('openImport', 'link', 'Paste a link', 'Recipe sites, Instagram, TikTok, YouTube, Facebook, Pinterest', 'link');
   h += opt('openImport', 'camera', 'From photos or screenshots', 'Cookbook pages, recipe cards, screenshots', 'photo');
   h += opt('openImport', 'text', 'Paste the recipe text', 'From notes, emails or a caption you copied', 'text');
+  h += opt('openImport', 'search', 'Search for a recipe', 'Type a dish and pick from recipe sites', 'find');
   h += opt('blank', 'pen', 'Write it myself', 'Start from a blank recipe card');
   return sheet(h, 'Add a recipe');
 }
+function vDishSearch(o){
+  let h = '';
+  if (o.reason) h += '<div class="banner"><div><b>' + esc(o.reason) + '</b> Tell us what dish it is and we’ll find versions from recipe sites for you to choose from.</div></div>';
+  h += '<div class="field"><label for="im-dish">' + (o.reason ? 'What dish is it?' : 'What do you want to make?') + '</label><div class="row" style="flex-wrap:nowrap"><input id="im-dish" class="inp" placeholder="e.g. Marry me chicken" value="' + esc(dv('im-dish')) + '" data-enter="findRecipes" autocomplete="off"><button class="btn primary" data-act="findRecipes"' + (o.busy ? ' disabled' : '') + '>' + (o.busy ? '<span class="spin"></span>' : I.search) + 'Find</button></div></div>';
+  if (o.busy) h += '<p class="muted small" style="margin:0">Searching recipe sites. This can take up to 30 seconds.</p>';
+  if (o.error) h += '<div class="banner warn"><div>' + esc(o.error) + '</div></div>';
+  if (o.results && o.results.length) {
+    h += '<div class="lbl">Pick one</div><div class="tiles">' + o.results.map((r, i) => {
+      const stars = r.rating ? '<span class="mini-stars">' + '★'.repeat(Math.round(r.rating.value)) + '</span> ' + r.rating.value + (r.rating.count ? ' (' + r.rating.count.toLocaleString() + ')' : '') : '<span>No ratings</span>';
+      return '<button class="tile' + (o.pick === i ? ' on' : '') + '" data-act="pickResult" data-i="' + i + '" aria-pressed="' + (o.pick === i) + '"><span class="pic">' + indexCard({ title: r.title }) + (r.imageUrl ? '<img alt="" loading="lazy" referrerpolicy="no-referrer" src="' + esc(r.imageUrl) + '" onerror="this.remove()">' : '') + '</span><span style="min-width:0"><span class="tt">' + esc(r.title) + '</span><span class="meta"><span>' + esc(r.site) + '</span>' + (r.totalMin ? '<span>' + mins(r.totalMin) + '</span>' : '') + '</span><span class="meta">' + stars + '</span>' +
+        ((r.diets || []).length ? '<span class="diets">' + r.diets.map(d => '<span class="diet">' + esc(d) + '</span>').join('') + '</span>' : '') + '</span></button>';
+    }).join('') + '</div>';
+    h += '<p class="small muted" style="margin:0">Diet labels are a best guess from the ingredients. Double-check if it matters for allergies.</p>';
+    h += '<div class="row" style="justify-content:flex-end"><button class="btn primary" data-act="useResult"' + (o.pick == null || o.using ? ' disabled' : '') + '>' + (o.using ? '<span class="spin"></span>' : I.check) + 'Use this recipe</button></div>';
+  } else if (o.results && !o.busy) h += '<div class="banner warn"><div>Couldn’t find recipes for that. Try a different name, like “chicken tortilla soup” instead of “Mom’s soup”.</div></div>';
+  if (o.srcPost && o.mode !== 'find') h += '<div class="row"><button class="btn small" data-act="imSwitch" data-v="photo">' + I.camera + 'Use screenshots instead</button></div>';
+  return h;
+}
 function vImport(o){
-  const titles = { link: 'Import from a link', photo: 'Import from photos', text: 'Import from text', share: 'Shared recipe' };
-  let h = '<div class="ov"><div class="ov-in">' + bar(titles[o.mode] || 'Import');
+  const titles = { link: 'Import from a link', photo: 'Import from photos', text: 'Import from text', share: 'Shared recipe', find: 'Search for a recipe' };
+  let h = '<div class="ov" data-scroll="import"><div class="ov-in">' + bar(o.stage === 'dish' && o.mode !== 'find' ? 'Find the recipe' : (titles[o.mode] || 'Import'));
   h += '<div style="display:grid;gap:16px">';
+  if (o.stage === 'dish') return h + vDishSearch(o) + '</div></div></div>';
   if (o.mode === 'share') {
     const what = o.shared || {};
     h += '<div class="banner"><div style="min-width:0;overflow-wrap:anywhere">' + (what.url ? '<b>Link:</b> ' + esc(what.url) : '') + (what.text && !what.url ? esc(what.text.slice(0, 200)) : '') + ((what.files || []).length ? '<b>' + what.files.length + ' image' + (what.files.length > 1 ? 's' : '') + '</b>' : '') + '</div></div>';
@@ -1067,7 +1099,8 @@ const A = {
   async openImport(d){
     S.ov.pop(); clearDrafts('im-');
     const max = 5;
-    S.ov.push({ type: 'import', mode: d.v, files: [], max }); render();
+    S.ov.push({ type: 'import', mode: d.v, files: [], max, stage: d.v === 'find' ? 'dish' : null }); render();
+    if (d.v === 'find') setTimeout(() => { const n = document.getElementById('im-dish'); if (n) n.focus(); }, 30);
   },
   imFiles(d, el){ const o = top(); o.files = Array.from(el.files || []).slice(0, o.max || 5); o.error = ''; render(); },
   imClear(){ top().files = []; render(); },
@@ -1087,6 +1120,7 @@ const A = {
         if (o.mode === 'photo') body.url = (dv('im-src') || '').trim();
       }
       const res = await api('import', { body, signal: importCtl.signal });
+      if (res.needsDish) { o.busy = false; o.stage = 'dish'; o.reason = res.reason || ''; o.srcPost = res.url || body.url || ''; o.results = null; o.pick = null; o.error = ''; S.drafts['im-dish'] = res.dish || ''; render(); setTimeout(() => { const n = document.getElementById('im-dish'); if (n && !n.value) n.focus(); }, 30); return; }
       if (!res.recipe) { o.busy = false; o.error = res.error || 'Couldn’t find a recipe there.'; if (res.url) S.drafts['im-src'] = res.url; render(); return; }
       S.ov.pop();
       const rec = res.recipe;
@@ -1095,7 +1129,25 @@ const A = {
     } catch (e) { o.busy = false; o.error = sampleErr(e); render(); }
     finally { importCtl = null; }
   },
-  imSwitch(d){ const o = top(); const src = (o.shared && o.shared.url) || dv('im-url') || dv('im-src'); o.mode = d.v; o.error = ''; o.files = []; o.shared = null; S.drafts['im-src'] = src || ''; render(); },
+  async findRecipes(){
+    const o = top(); if (!o || o.type !== 'import') return;
+    const dish = (S.drafts['im-dish'] || '').trim(); if (dish.length < 2) { o.error = 'Type the name of the dish.'; render(); return; }
+    o.busy = true; o.error = ''; o.results = null; o.pick = null; render();
+    importCtl = new AbortController();
+    try { const j = await api('find', { body: { dish }, signal: importCtl.signal }); o.results = j.results || []; if (o.results.length === 1) o.pick = 0; }
+    catch (e) { o.error = sampleErr(e) || ''; }
+    finally { o.busy = false; importCtl = null; render(); }
+  },
+  pickResult(d){ const o = top(); o.pick = +d.i; render(); },
+  async useResult(){
+    const o = top(); const r = o.results && o.results[o.pick]; if (!r) return;
+    o.using = true; render();
+    let imageId = null; if (r.imageUrl) { try { imageId = (await api('photo-from-url', { body: { url: r.imageUrl } })).id; } catch (e) {} }
+    const rec = Object.assign({}, r.recipe, { imageId, sourceUrl: r.url, notes: [r.recipe.notes, o.srcPost ? 'Found for this post: ' + o.srcPost : ''].filter(Boolean).join('\n') });
+    rec.cookbookIds = (S.ui.cookbook !== 'all' && S.ui.cookbook !== 'none' && S.ui.cookbook !== 'notcooked') ? [S.ui.cookbook] : [];
+    S.ov.pop(); openEditor(rec, { imported: true, method: 'found', site: r.site });
+  },
+  imSwitch(d){ const o = top(); const src = (o.shared && o.shared.url) || dv('im-url') || dv('im-src'); o.mode = d.v; o.stage = null; o.results = null; o.error = ''; o.files = []; o.shared = null; S.drafts['im-src'] = src || ''; render(); },
   async pasteUrl(){ try { const t = await navigator.clipboard.readText(); const u = (t.match(/https?:\/\/\S+/) || [t])[0].trim(); S.drafts['im-url'] = u; render(); } catch (e) { toast('Couldn’t read the clipboard. Long-press the box and tap Paste.'); } },
   install(){ if (!installEvt) return; installEvt.prompt(); installEvt.userChoice.finally(() => { installEvt = null; render(); }); },
   hideInstall(){ lsSet('hideInstall', true); render(); },
