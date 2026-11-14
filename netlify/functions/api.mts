@@ -10,6 +10,7 @@ import {
 import { FIREBASE_PROJECT_ID } from "../../lib/firebase-config.mjs";
 
 const MODEL = "claude-haiku-5-5";
+const BACKUP_MODEL = "claude-sonnet-5-5";
 const COLLECTIONS = ["recipes", "cookbooks", "plan", "groceries", "settings"];
 const ID_RE = /^[A-Za-z0-9_\-.~:@+]{1,80}$/;
 const AI_MONTHLY_LIMIT = Number(process.env.AI_MONTHLY_LIMIT || 40);
@@ -144,10 +145,13 @@ function claude() {
 async function ask(content: any, maxTokens = 3000, system?: string): Promise<string> {
   const c = claude();
   if (!c) throw new Error("ai_unavailable");
-  const msg = await c.messages.create({
-    model: MODEL, max_tokens: maxTokens, ...(system ? { system } : {}),
-    messages: Array.isArray(content) && content[0]?.role ? content : [{ role: "user", content }],
-  });
+  const req = { max_tokens: maxTokens, ...(system ? { system } : {}), messages: Array.isArray(content) && content[0]?.role ? content : [{ role: "user", content }] };
+  let msg: any;
+  try { msg = await c.messages.create({ model: MODEL, ...req } as any); }
+  catch (e: any) {
+    console.error("Claude call failed on " + MODEL + ":", e?.status, String(e?.message || e).slice(0, 300));
+    msg = await c.messages.create({ model: BACKUP_MODEL, ...req } as any);
+  }
   return msg.content.map((b: any) => (b.type === "text" ? b.text : "")).join("").trim();
 }
 
@@ -239,11 +243,17 @@ type Found = { recipe?: any; caption?: string; imageUrl?: string; author?: strin
 async function lookUp(url: string): Promise<Found> {
   const platform = platformOf(url);
   if (platform === "tiktok") {
-    let finalUrl = url;
-    try { const g = await grab(url, BROWSER_UA, 8000); finalUrl = g.url || url; } catch {}
-    const o = await grab("https://www.tiktok.com/oembed?url=" + encodeURIComponent(finalUrl), BROWSER_UA, 8000);
-    let j: any = {}; try { j = JSON.parse(o.text); } catch {}
-    return { caption: j.title || "", imageUrl: j.thumbnail_url, author: j.author_name, finalUrl, platform };
+    let finalUrl = url, page = "";
+    try { const g = await grab(url, BROWSER_UA, 8000); finalUrl = (g.url || url).split("?")[0]; page = g.text; } catch {}
+    let j: any = {};
+    try { const o = await grab("https://www.tiktok.com/oembed?url=" + encodeURIComponent(finalUrl), BROWSER_UA, 8000); j = JSON.parse(o.text); } catch {}
+    let caption = String(j.title || "");
+    if (caption.length < 40 && page) { // oEmbed can come back empty; the video page carries the caption too
+      const m = page.match(/"desc":"((?:[^"\\]|\\.)*)"/);
+      if (m) { try { const d = JSON.parse('"' + m[1] + '"'); if (d.length > caption.length) caption = d; } catch {} }
+      if (caption.length < 40) { const og = getMeta(page, "og:description") || getMeta(page, "description"); if (og.length > caption.length) caption = og; }
+    }
+    return { caption, imageUrl: j.thumbnail_url || getMeta(page, "og:image"), author: j.author_name, finalUrl, platform };
   }
   if (platform === "youtube") {
     const g = await grab(url);
@@ -421,6 +431,11 @@ export default async (req: Request, _ctx: Context) => {
       if (url.searchParams.get("check") === "ai") {
         try { const c = claude(); if (!c) throw new Error("no key"); const m: any = await c.messages.create({ model: MODEL, max_tokens: 5, messages: [{ role: "user", content: "Say ok" }] }); out.aiCheck = "ok: " + (m.content?.[0]?.text || "").slice(0, 20); }
         catch (e: any) { out.aiCheck = "failed: " + (e?.status || "") + " " + String(e?.message || e).slice(0, 300); }
+      }
+      const testUrl = url.searchParams.get("url") || "";
+      if (testUrl && ["tiktok", "instagram", "facebook", "youtube", "threads"].includes(platformOf(testUrl))) {
+        try { const f = await lookUp(testUrl); out.linkCheck = { platform: f.platform, finalUrl: f.finalUrl, captionChars: (f.caption || "").length, captionStart: (f.caption || "").slice(0, 80) }; }
+        catch (e: any) { out.linkCheck = "failed: " + String(e?.message || e).slice(0, 200); }
       }
       return json(out);
     }
