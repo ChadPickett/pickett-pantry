@@ -146,14 +146,41 @@ async function ask(content: any, maxTokens = 3000, system?: string): Promise<str
   const c = claude();
   if (!c) throw new Error("ai_unavailable");
   const req = { max_tokens: maxTokens, ...(system ? { system } : {}), messages: Array.isArray(content) && content[0]?.role ? content : [{ role: "user", content }] };
-  let msg: any;
-  try { msg = await c.messages.create({ model: MODEL, ...req } as any); }
-  catch (e: any) {
-    console.error("Claude call failed on " + MODEL + ":", e?.status, String(e?.message || e).slice(0, 300));
-    msg = await c.messages.create({ model: BACKUP_MODEL, ...req } as any);
-  }
-  return msg.content.map((b: any) => (b.type === "text" ? b.text : "")).join("").trim();
+  let msg: any, lastErr: any;
+  const tried = new Set<string>();
+  const tryModel = async (m: string) => {
+    tried.add(m);
+    try { msg = await c.messages.create({ model: m, ...req } as any); workingModel = m; return true; }
+    catch (e: any) { lastErr = e; console.error("Claude call failed on " + m + ":", e?.status, String(e?.message || e).slice(0, 300)); return false; }
+  };
+  if (await tryModel(workingModel)) return textOf(msg);
+  // A 404 means the gateway no longer serves that model: look up what it serves now and use that.
+  const candidates = [...(await liveModels()), BACKUP_MODEL].filter((m) => !tried.has(m)).slice(0, 3);
+  for (const m of candidates) if (await tryModel(m)) return textOf(msg);
+  throw lastErr || new Error("ai_unavailable");
 }
+const textOf = (msg: any) => (msg.content || []).map((b: any) => (b.type === "text" ? b.text : "")).join("").trim();
+
+let workingModel = MODEL;
+let modelCache: { at: number; list: string[] } | null = null;
+/** Claude models the Netlify AI Gateway serves right now, best fit first (small and fast before large). */
+async function liveModels(): Promise<string[]> {
+  if (modelCache && Date.now() - modelCache.at < 3600_000) return modelCache.list;
+  try {
+    const ctl = new AbortController(); const tm = setTimeout(() => ctl.abort(), 6000);
+    const r = await fetch("https://api.netlify.com/api/v1/ai-gateway/providers/detailed", { signal: ctl.signal });
+    clearTimeout(tm);
+    const text = await r.text();
+    const ids = Array.from(new Set((text.match(/claude-[a-z]+-[0-9][a-z0-9-]*/g) || []).filter((m) => !/\d{8}$/.test(m))));
+    const ver = (m: string) => (m.match(/-(\d+)(?:-(\d+))?/) || []).slice(1).map((x) => Number(x || 0));
+    const rank = (m: string) => (/haiku/.test(m) ? 0 : /sonnet/.test(m) ? 1 : /fable/.test(m) ? 3 : 2);
+    ids.sort((a, b) => rank(a) - rank(b) || (ver(b)[0] - ver(a)[0]) || (ver(b)[1] - ver(a)[1]));
+    console.error("Gateway Claude models:", ids.join(", ") || "none found (status " + r.status + ")");
+    modelCache = { at: Date.now(), list: ids };
+    return ids;
+  } catch (e: any) { console.error("Model list lookup failed:", e?.message); return []; }
+}
+
 
 const IMPORT_RULES = `You turn recipe content into clean JSON for a home recipe app. Use only what the content says. Never invent ingredients, amounts or steps. If something is missing, use null or an empty list.
 Ingredients: one line each, written as "quantity unit ingredient, prep note" (for example "2 cups flour, sifted" or "3 cloves garlic, minced"). Use plain fractions like 1/2. If the recipe has sections, add a line ending in a colon before each section (for example "For the sauce:").
@@ -343,7 +370,7 @@ async function searchWithClaude(dish: string): Promise<{ urls: string[]; ai: boo
   const c = claude(); if (!c) return { urls: [], ai: false };
   try {
     const msg: any = await c.messages.create({
-      model: MODEL, max_tokens: 1500,
+      model: workingModel, max_tokens: 1500,
       tools: [{ type: "web_search_20250305", name: "web_search", max_uses: 2 }] as any,
       messages: [{ role: "user", content: `Search the web for well-reviewed home-cook recipes for "${dish}" on recipe websites or food blogs. Skip YouTube, TikTok, Instagram, Facebook, Pinterest and Reddit. Reply with only a JSON array of up to 8 recipe page URLs, best first.` }],
     } as any);
@@ -429,8 +456,9 @@ export default async (req: Request, _ctx: Context) => {
       const out: any = { ai: !!aiCreds().key, configured: !FIREBASE_PROJECT_ID.startsWith("REPLACE"),
         env: Object.fromEntries(["ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "NETLIFY_AI_GATEWAY_KEY", "NETLIFY_AI_GATEWAY_URL"].map((n) => [n, !!envVar(n)])) };
       if (url.searchParams.get("check") === "ai") {
-        try { const c = claude(); if (!c) throw new Error("no key"); const m: any = await c.messages.create({ model: MODEL, max_tokens: 5, messages: [{ role: "user", content: "Say ok" }] }); out.aiCheck = "ok: " + (m.content?.[0]?.text || "").slice(0, 20); }
+        try { const r = await ask("Say ok", 5); out.aiCheck = "ok: " + r.slice(0, 20) + " (model " + workingModel + ")"; }
         catch (e: any) { out.aiCheck = "failed: " + (e?.status || "") + " " + String(e?.message || e).slice(0, 300); }
+        out.gatewayModels = await liveModels();
       }
       const testUrl = url.searchParams.get("url") || "";
       if (testUrl && ["tiktok", "instagram", "facebook", "youtube", "threads"].includes(platformOf(testUrl))) {
